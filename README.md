@@ -7,7 +7,7 @@
 </h2>
 
 <div align="center" style="line-height: 1;">
-  <a href="https://github.com/facebookresearch/eb_jepa" target="_blank" style="margin: 2px;"><img alt="Github" src="https://img.shields.io/badge/Github-facebookresearch/eb__jepa-black?logo=github" style="display: inline-block; vertical-align: middle;"/></a>
+  <a href="https://github.com/Trick5t3r/eb_jepa" target="_blank" style="margin: 2px;"><img alt="Github" src="https://img.shields.io/badge/Github-Trick5t3r/eb__jepa-black?logo=github" style="display: inline-block; vertical-align: middle;"/></a>
   <a href="https://arxiv.org/abs/2602.03604" target="_blank" style="margin: 2px;"><img alt="ArXiv" src="https://img.shields.io/badge/arXiv-2602.03604-b5212f?logo=arxiv" style="display: inline-block; vertical-align: middle;"/></a>
 </div>
 
@@ -72,6 +72,8 @@ JEPA for world modeling + planning in Two Rooms environment.
 
 ## 🚀 Installation
 
+### Local / generic (start here)
+
 We use [uv](https://docs.astral.sh/uv/guides/projects/) for package management.
 
 ```bash
@@ -79,9 +81,9 @@ We use [uv](https://docs.astral.sh/uv/guides/projects/) for package management.
 uv sync
 # Option 1: Activate virtual environment
 source .venv/bin/activate
-python main.py
+python -m examples.image_jepa.main
 # Option 2: Run directly with uv
-uv run python main.py
+uv run python -m examples.image_jepa.main
 ```
 If you need conda-specific packages, you can use **Conda + uv**
 
@@ -89,18 +91,48 @@ If you need conda-specific packages, you can use **Conda + uv**
 # Create conda environment with Python 3.12
 conda create -n eb_jepa python=3.12 -y
 conda activate eb_jepa
-# Install package in editable mode with dev dependencies (pytest, black, isort)
+# Install package in editable mode with dev dependencies (pytest, black, isort, autoflake)
 uv pip install -e . --group dev
 ```
 
 Add these to your `~/.bashrc` for persistent configuration.
 
 ```bash
-# Required for SLURM jobs to find datasets
+# Where datasets are stored / looked up
 export EBJEPA_DSETS=/path/to/eb_jepa/datasets
 # Optional: Directory for checkpoints and logs
 export EBJEPA_CKPTS=/path/to/checkpoints
 ```
+
+Verify the install with `uv run pytest tests/`.
+
+### HTW cluster — quick start (optional, hackathon only)
+
+> Skip this section unless you are on the HTW hackathon cluster — the generic install above is all you need locally.
+
+**Everything must live on `/lustre/work`, not your home** — the `/lustre/home` quota is
+small and blocks git, venvs and model downloads. You don't have to clone in the right
+place: `setup.sh` **relocates itself to `/lustre/work` automatically**.
+
+```bash
+# 1. clone anywhere (even your home) and run setup
+git clone https://github.com/Trick5t3r/eb_jepa.git eb_jepa && cd eb_jepa
+bash setup.sh
+#    -> the repo is copied to /lustre/work/pdl17890/$USER/eb_jepa, set up there,
+#       and the folder you cloned in is reduced to a one-line pointer README.
+
+# 2. move into the work copy (the pointer README tells you the exact path)
+cd /lustre/work/pdl17890/$USER/eb_jepa
+
+# 3. make it persistent + verify
+echo "source $(pwd)/env.sh" >> ~/.bashrc && source ~/.bashrc
+sbatch slurm_test.sh        # runs pytest on a GPU node
+```
+
+`env.sh` derives everything from `$USER`, keeps **all** caches (uv, HuggingFace, torch,
+triton/`torch.compile`, pip, W&B) under `$WORK/.cache` — nothing touches home. Override the work
+root with `export EBJEPA_WORK=/your/path` before running setup, and set `EBJEPA_DSETS` to your
+dataset folder.
 
 
 
@@ -145,7 +177,7 @@ checkpoints/
 
 | Command | Description |
 |---------|-------------|
-| `--example {name}` | Choose: `image_jepa`, `video_jepa`, `ac_video_jepa` |
+| `--example {name}` | Choose: `image_jepa`, `video_jepa`, `ac_video_jepa`, `maze`, `fintime`, `ltsf`, `eeg`, `audio`, `pointcloud`, `gray_scott` |
 | `--fname {path}` | Run the sweep specified in the config at `{path}` |
 | `--single` | Launch single job (dev mode) |
 | `--sweep {name}` | Custom sweep name |
@@ -170,7 +202,7 @@ python -m examples.launch_sbatch --example image_jepa --fname examples/image_jep
 python -m examples.launch_sbatch --example image_jepa --fname examples/image_jepa/cfgs/default.yaml --use-wandb-sweep
 ```
 
-Replace `image_jepa` with `ac_video_jepa` or `video_jepa` for other examples.
+Replace `image_jepa` with `ac_video_jepa`, `video_jepa`, or `maze` for other examples.
 
 **Full Sweep Configuration:** The `--full-sweep` flag reads the `sweep.param_grid` section from the example's YAML config file (e.g., `examples/image_jepa/cfgs/default.yaml`). Without this flag, only a 3-seed sweep is launched. To customize sweep parameters, edit the `sweep` section in the config:
 
