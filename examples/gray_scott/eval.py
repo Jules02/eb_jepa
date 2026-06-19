@@ -15,6 +15,7 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn as nn
 from omegaconf import OmegaConf
 
 from eb_jepa.datasets.gray_scott.dataset import GrayScottConfig, make_loader
@@ -53,38 +54,107 @@ def rollout_latents(jepa, x, H, device):
 # --------------------------------------------------------------------------- #
 # LATENT -> FIELD DECODER  — # TODO
 # --------------------------------------------------------------------------- #
-def build_decoder(dstc, device):
-    """TODO: return a trained latent->field decoder mapping ``[B, D, T, H, W]`` ->
-    ``[B, 2, T, H, W]`` (the JEPA has no decoder — predicting latents is the point,
-    so to score VRMSE in field space you must add one).
+class _FrameDecoder(nn.Module):
+    """Per-frame latent->field decoder: [B,D,T,H,W] -> [B,2,T,H,W]."""
+    def __init__(self, D, hid=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(D, hid, 3, padding=1), nn.GELU(),
+            nn.Conv2d(hid, hid, 3, padding=1), nn.GELU(),
+            nn.Conv2d(hid, 2, 1),
+        )
 
-    A small conv stack suffices when the encoder is stride-1 / no-pool (latent is
-    full 128x128): ``Conv2d(D, hid, 3) -> GELU -> Conv2d(hid, hid, 3) -> GELU ->
-    Conv2d(hid, 2, 1)`` applied per frame. Train it with the JEPA FROZEN to
-    minimise ``MSE(decode(encode(field)), field)`` on the train split, then load
-    its weights here. Its reconstruction error is the JEPA's irreducible field
-    floor (``decode(encode(truth))``), so report that floor alongside the rollout."""
-    raise NotImplementedError("TODO: build + load the latent->field decoder (see docstring)")
+    def forward(self, z):
+        B, D, T, H, W = z.shape
+        out = self.net(z.permute(0, 2, 1, 3, 4).reshape(B * T, D, H, W))
+        return out.view(B, T, 2, H, W).permute(0, 2, 1, 3, 4)
+
+
+def _train_decoder(decoder, jepa, encoder, device, epochs=5):
+    """Train decoder (frozen JEPA) to minimise MSE(decode(encode(x)), x)."""
+    dcfg = GrayScottConfig(split="train", epoch_size=2000, batch_size=8, num_workers=4)
+    loader = make_loader(dcfg)
+    opt = torch.optim.Adam(decoder.parameters(), lr=1e-3)
+    decoder.train()
+    for ep in range(epochs):
+        total, n = 0.0, 0
+        for batch in loader:
+            x = batch["video"].to(device)          # [B,2,T,H,W]
+            with torch.no_grad():
+                z = encoder(x)                     # [B,D,T,H,W]
+            recon = decoder(z)                     # [B,2,T,H,W]
+            loss = nn.functional.mse_loss(recon, x)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            total += loss.item(); n += 1
+        print(f"[decoder] ep{ep} mse={total/n:.4f}", flush=True)
+    decoder.eval()
+
+
+def build_decoder(dstc, device, ckpt_path=None):
+    """Build (and optionally train) a latent->field decoder.
+
+    If ``ckpt_path`` points to a file that contains a ``'decoder'`` key the
+    weights are loaded directly (no training). Otherwise the decoder is trained
+    from scratch against the frozen JEPA loaded from ``ckpt_path``."""
+    decoder = _FrameDecoder(D=dstc).to(device)
+    if ckpt_path is not None:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        if "decoder" in ckpt:
+            decoder.load_state_dict(ckpt["decoder"])
+            print(f"[decoder] loaded weights from {ckpt_path}", flush=True)
+            return decoder
+        # No saved decoder weights — train from the checkpoint's frozen JEPA
+        jepa, encoder = load_jepa(ckpt, device)
+        _train_decoder(decoder, jepa, encoder, device)
+        # Save decoder weights back into the checkpoint for next time
+        ckpt["decoder"] = decoder.state_dict()
+        torch.save(ckpt, ckpt_path)
+        print(f"[decoder] weights saved to {ckpt_path}", flush=True)
+    return decoder
 
 
 # --------------------------------------------------------------------------- #
 # METRIC  — # TODO
 # --------------------------------------------------------------------------- #
+@torch.no_grad()
 def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
-    """TODO: per-horizon field-space VRMSE for JEPA vs a persistence baseline
-    (and, optionally, FNO / U-Net surrogates trained iso-protocol).
+    """Per-horizon field-space VRMSE for JEPA, persistence, and decoder floor.
 
-    VRMSE (The Well) = sqrt( <(pred-true)^2>_space / <(true-<true>)^2>_space ).
-    AGGREGATE numerator and denominator across the batch and take the ratio ONCE
-    at the end — per-sample ratios blow up on near-uniform frames (Gray-Scott
-    channel B has tiny spatial variance). Protocol, iso for all models:
-      * ground truth   : true[h] = x[:, :, C-1+h]            for h = 1..H
-      * JEPA           : decode(rollout_latents(...))        (latent -> field)
-      * persistence    : repeat the last context field x[:, :, C-1]
-      * decoder_floor  : decode(encode(true field))          (irreducible floor)
-    Return a dict ``{name: np.ndarray[H] of VRMSE}``. Lower-than-persistence and
-    the gap to the surrogates is the answer to The Well's question."""
-    raise NotImplementedError("TODO: implement the VRMSE metric (see docstring)")
+    VRMSE = sqrt(sum_space (pred-true)^2 / sum_space (true - mean_true)^2).
+    Numerators and denominators are aggregated across the full dataset before
+    taking the ratio (avoids blow-up on near-uniform frames)."""
+    num = {k: np.zeros(H) for k in ("jepa", "persistence", "floor")}
+    den = {k: np.zeros(H) for k in ("jepa", "persistence", "floor")}
+
+    for batch in loader:
+        x = batch["video"].to(device)                          # [B,2,C+H,H,W]
+        last_ctx = x[:, :, C - 1]                             # [B,2,H,W]
+
+        # JEPA: roll predictor in latent space then decode
+        pred_z = rollout_latents(jepa, x, H, device)          # [B,D,C+H,h,w]
+        pred_fields = decoder(pred_z[:, :, C:])               # [B,2,H,H,W]
+
+        for h in range(H):
+            true = x[:, :, C + h]                             # [B,2,H,W]
+            mu = true.mean(dim=(-2, -1), keepdim=True)
+            spatial_var = ((true - mu) ** 2).sum(dim=(-2, -1))  # [B,2]
+
+            def _accum(name, pred_hw):
+                sq_err = ((pred_hw - true) ** 2).sum(dim=(-2, -1))  # [B,2]
+                num[name][h] += sq_err.sum().item()
+                den[name][h] += spatial_var.sum().item()
+
+            _accum("jepa", pred_fields[:, :, h])
+            _accum("persistence", last_ctx)
+
+            # Decoder floor: decode(encode(ground-truth frame))
+            z_true = encoder(true.unsqueeze(2))                # [B,D,1,H,W]
+            floor_field = decoder(z_true).squeeze(2)           # [B,2,H,W]
+            _accum("floor", floor_field)
+
+    return {k: np.sqrt(num[k] / np.maximum(den[k], 1e-8)) for k in num}
 
 
 def main():
@@ -95,7 +165,7 @@ def main():
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     jepa, encoder = load_jepa(ckpt, device)
     dstc = int(OmegaConf.create(ckpt["cfg"]).model.dstc)
-    decoder = build_decoder(dstc, device)
+    decoder = build_decoder(dstc, device, ckpt_path=ckpt_path)
     print(f"[gs-eval] loaded (epoch {ckpt.get('epoch')}), H={H}", flush=True)
 
     dcfg = GrayScottConfig(split="valid", n_frames=C + H, time_stride=4,

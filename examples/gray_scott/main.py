@@ -23,49 +23,38 @@ import time
 import torch
 from omegaconf import OmegaConf
 
+from eb_jepa.architectures import Projector, ResNet5, ResUNet, StateOnlyPredictor
 from eb_jepa.datasets.gray_scott.dataset import GrayScottConfig, make_loader
-
-# Reuse the eb_jepa core — DO NOT reimplement these:
-#   eb_jepa.architectures: ResNet5 / ImpalaEncoder (2D encoders), ResUNet
-#                          (latent->latent predictor backbone),
-#                          StateOnlyPredictor (rolls latents forward), Projector
-#   eb_jepa.losses:        VCLoss (variance+covariance anti-collapse), SquareLossSeq
-#   eb_jepa.jepa:          JEPA (online+target encoder, predictor, .unroll(...))
+from eb_jepa.jepa import JEPA
+from eb_jepa.losses import SquareLossSeq, VCLoss
+from eb_jepa.training_utils import setup_wandb
 
 
 # --------------------------------------------------------------------------- #
 # 1) ENCODER  — # TODO
 # --------------------------------------------------------------------------- #
 def build_encoder(cfg):
-    """TODO: return a 2D frame encoder mapping a frame ``[B, 2, H, W]`` (the two
-    chemical fields) to a latent ``[B, D, h, w]``. It must also accept the 5D clip
-    ``[B, 2, T, H, W]`` and return ``[B, D, T, h, w]`` (the eb_jepa 2D encoders do
-    this via ``TemporalBatchMixin`` — they fold T into the batch automatically).
-
-    Hints: ``eb_jepa.architectures.ResNet5(in_d=2, h_d=henc, out_d=dstc)`` is the
-    drop-in choice — stride-1 / no avg-pool keeps the latent at full ``h=w=128``
-    resolution (so a decoder can later map it back to a field). ``ImpalaEncoder``
-    is the heavier alternative. Expose ``out_d`` (= D = dstc) for downstream use."""
-    raise NotImplementedError("TODO: build the 2D frame encoder (see docstring)")
+    # stride-1 everywhere (default), no avg-pool -> latent stays 128x128
+    # TemporalBatchMixin on ResNet5 folds T into batch for 5D inputs
+    return ResNet5(in_d=cfg.dobs, h_d=cfg.henc, out_d=cfg.dstc)
 
 
 # --------------------------------------------------------------------------- #
 # 2) TEMPORAL-JEPA ASSEMBLY  — # TODO
 # --------------------------------------------------------------------------- #
 def build_jepa(encoder, cfg):
-    """TODO: assemble and return an ``eb_jepa.jepa.JEPA`` (predictive/temporal,
-    NOT two-view). The pieces, all reused from eb_jepa:
-      * online + target encoder: pass ``encoder`` as both — JEPA keeps an EMA copy
-        of the target internally (no-grad target of the future latent).
-      * predictor that ROLLS LATENTS FORWARD: wrap a ``ResUNet(2*D, hpre, D)`` in
-        ``StateOnlyPredictor(..., context_length=2)`` — it predicts the next latent
-        from the previous two (state-only, no actions).
-      * anti-collapse: ``VCLoss(std_coeff, cov_coeff, proj=Projector("D-4D-4D"))``.
-      * prediction loss: ``SquareLossSeq(projector)`` on the projected latents.
-    Build via ``JEPA(encoder, encoder, predictor, regularizer, predcost)``; the
-    training loop below drives it with ``jepa.unroll(x, actions=None, ...)``.
-    Keep the VC anti-collapse term — it is what stops the latent from collapsing."""
-    raise NotImplementedError("TODO: assemble the temporal JEPA (see docstring)")
+    D = cfg.dstc
+    predictor = StateOnlyPredictor(
+        ResUNet(in_d=2 * D, h_d=cfg.hpre, out_d=D),
+        context_length=2,
+    )
+    regularizer = VCLoss(
+        cfg.std_coeff, cfg.cov_coeff,
+        proj=Projector(f"{D}-{4*D}-{4*D}"),
+    )
+    predcost = SquareLossSeq()
+    # actions=None throughout, so the action encoder (arg 2) is never called
+    return JEPA(encoder, None, predictor, regularizer, predcost)
 
 
 # --------------------------------------------------------------------------- #
@@ -98,6 +87,23 @@ def run(fname="examples/gray_scott/cfgs/train.yaml", cfg=None, folder=None, **ov
 
     ckpt_dir = folder or cfg.meta.ckpt_dir
     os.makedirs(ckpt_dir, exist_ok=True)
+
+    wandb_run = setup_wandb(
+        project=cfg.logging.get("wandb_project", "eb_jepa"),
+        config={"example": "gray_scott", **OmegaConf.to_container(cfg, resolve=True)},
+        run_dir=ckpt_dir,
+        run_name=cfg.logging.get("wandb_run_name", "gray_scott"),
+        tags=["gray_scott", f"seed_{cfg.meta.seed}"],
+        enabled=bool(cfg.logging.get("log_wandb", False)),
+    )
+
+    def _save(name):
+        torch.save({"epoch": epoch,
+                    "encoder": encoder.state_dict(),
+                    "jepa": jepa.state_dict(),
+                    "cfg": OmegaConf.to_container(cfg, resolve=True)},
+                   os.path.join(ckpt_dir, name))
+
     gstep = 0
     for epoch in range(cfg.optim.epochs):
         jepa.train()
@@ -117,6 +123,11 @@ def run(fname="examples/gray_scott/cfgs/train.yaml", cfg=None, folder=None, **ov
             if gstep % cfg.logging.log_every == 0:
                 print(f"e{epoch} s{gstep} loss={jepa_loss.item():.4f} "
                       f"vc={regl.item():.4f} pred={pl.item():.4f}", flush=True)
+                if wandb_run:
+                    import wandb
+                    wandb.log({"train/loss": jepa_loss.item(),
+                               "train/vc_loss": regl.item(),
+                               "train/pred_loss": pl.item()}, step=gstep)
 
         # val
         jepa.eval(); vl = 0.0; nb = 0
@@ -127,12 +138,23 @@ def run(fname="examples/gray_scott/cfgs/train.yaml", cfg=None, folder=None, **ov
                     _, (jl, _, _, _, _) = jepa.unroll(x, actions=None, nsteps=cfg.model.steps,
                                                       unroll_mode="parallel", compute_loss=True)
                 vl += jl.item(); nb += 1
-        print(f"[epoch {epoch}] {time.time() - t0:.0f}s | val_loss={vl / max(nb, 1):.4f}", flush=True)
-        torch.save({"epoch": epoch,
-                    "encoder": encoder.state_dict(),
-                    "jepa": jepa.state_dict(),
-                    "cfg": OmegaConf.to_container(cfg, resolve=True)},
-                   os.path.join(ckpt_dir, "latest.pth.tar"))
+        val_loss = vl / max(nb, 1)
+        elapsed = time.time() - t0
+        print(f"[epoch {epoch}] {elapsed:.0f}s | val_loss={val_loss:.4f}", flush=True)
+        if wandb_run:
+            import wandb
+            wandb.log({"val/loss": val_loss, "epoch": epoch,
+                       "train/loss_last": jepa_loss.item()}, step=gstep)
+
+        # always save latest; save numbered checkpoint every save_every epochs
+        _save("latest.pth.tar")
+        save_every = cfg.logging.get("save_every", 5)
+        if (epoch + 1) % save_every == 0:
+            _save(f"epoch_{epoch}.pth.tar")
+
+    if wandb_run:
+        import wandb
+        wandb.finish()
     print(f"[gs] done -> {ckpt_dir}/latest.pth.tar", flush=True)
 
 
