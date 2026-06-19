@@ -1,0 +1,69 @@
+logging:
+  log_wandb: true
+  wandb_group:
+  wandb_sweep:
+  log_every: 10
+  exp_suffix: tdist
+  save_every_n_epochs: 1
+  tqdm_silent: false
+meta:
+  model_folder:
+  load_model: true
+  enable_plan_eval: false   # only need encoder checkpoints for the latent-distance viz
+  eval_every_itr: -1
+  light_eval_freq: 50
+  seed: 1
+data:
+  env_name: two_rooms
+  batch_size: 384
+  num_workers: 16
+  pin_mem: true
+  persistent_workers: false
+  pipeline:
+    mode: stream
+    backend: gpu
+    chunk_size: 3840
+    gen_batch_size: null
+    dtype: bfloat16
+training:
+  use_amp: true
+  dtype: bfloat16
+model:
+  compile: true
+  dobs: 2
+  henc: 32
+  hpre: 32
+  dstc: 32
+  nsteps: 8
+  encoder_architecture: impala
+  train_rollout: last
+  encoder_skip_connections: True
+  predictor_skip_connections: True
+  regularizer:
+    # VICReg anti-collapse (unchanged) + the new temporal-distance ranking term:
+    # makes ||E(s_i)-E(s_j)|| grow monotonically with the trajectory gap |i-j|.
+    reg_type: vicreg
+    cov_coeff: 8
+    std_coeff: 16
+    sim_coeff_t: 12
+    idm_coeff: 1
+    tdist_coeff: 5.0          # weight on the temporal-distance ranking loss (tune me)
+    first_t_only: False
+    spatial_as_samples: false
+    use_proj: false
+    idm_after_proj: false
+    sim_t_after_proj: false
+optim:
+  epochs: 12
+  lr: 0.001
+  grad_clip_enc: 2.0
+  grad_clip_pred: 2.0
+  weight_decay: 1.e-5
+eval:
+  plan_cfg_path: examples/ac_video_jepa/cfgs/planning/two_rooms/planning_mppi.yaml
+  eval_cfg_path: examples/ac_video_jepa/cfgs/eval/two_rooms/eval.yaml
+
+sweep:
+  param_grid:
+    model.regularizer.tdist_coeff: [1, 5, 25]
+    meta.seed: [1, 1000, 10000]

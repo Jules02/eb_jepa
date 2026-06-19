@@ -184,6 +184,7 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
         reg_type: str = "vicreg",
         sigreg_coeff: float = 0.0,
         sigreg_num_slices: int = 256,
+        tdist_coeff: float = 0.0,
     ):
         """
         Composite Regularizer combining multiple losses
@@ -219,6 +220,12 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
         self.reg_type = reg_type
         self.sigreg_coeff = sigreg_coeff
         self.sigreg_num_slices = sigreg_num_slices
+
+        # Temporal-distance term: make latent distance grow monotonically with the
+        # temporal gap |i-j| along the trajectory, so ||E(s_i)-E(s_j)|| reflects the
+        # number of steps in the dataset trajectories (a proxy for geodesic distance,
+        # wall-aware) rather than raw Euclidean position distance.
+        self.tdist_coeff = tdist_coeff
 
         self.first_t_only = first_t_only
         self.projector = nn.Identity() if projector is None else projector
@@ -257,6 +264,11 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
             sim_loss_t = self.sim_loss_fn(x_projected_reshaped)
         else:
             sim_loss_t = self.sim_loss_fn(x_unprojected)
+
+        # TEMPORAL-DISTANCE LOSS (rank latent distances by temporal gap |i-j|)
+        tdist_loss = torch.zeros((), device=x.device)
+        if self.tdist_coeff > 0:
+            tdist_loss = self._temporal_dist(x_unprojected)
 
         # IDM LOSS
         idm_loss = torch.tensor(0.0, device=x.device)
@@ -308,9 +320,10 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
             vc_weighted
             + self.sim_coeff_t * sim_loss_t
             + self.idm_coeff * idm_loss
+            + self.tdist_coeff * tdist_loss
         )
         total_unweighted_loss = (
-            cov_loss + std_loss + sigreg_loss + sim_loss_t + idm_loss
+            cov_loss + std_loss + sigreg_loss + sim_loss_t + idm_loss + tdist_loss
         )
 
         loss_dict = {
@@ -319,9 +332,38 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
             "sigreg_loss": sigreg_loss.item(),
             "sim_loss_t": sim_loss_t.item(),
             "idm_loss": idm_loss if isinstance(idm_loss, float) else idm_loss.item(),
+            "tdist_loss": tdist_loss.item(),
         }
 
         return total_weighted_loss, total_unweighted_loss, loss_dict
+
+    def _temporal_dist(self, x_seq):
+        """Make latent distance reflect temporal (trajectory) distance.
+
+        For every anchor a, we want pairs closer in time to be closer in latent space:
+        gap(a, p) < gap(a, n)  =>  ||z_a - z_p|| < ||z_a - z_n||. We enforce this with a
+        scale-free pairwise logistic (Bradley-Terry) ranking over all such triplets.
+
+        Args:
+            x_seq: [T, B, D] encoded trajectory (T time steps, B batch, D features).
+        Returns:
+            Scalar ranking loss (0 if T < 3).
+        """
+        T = x_seq.shape[0]
+        if T < 3:
+            return torch.zeros((), device=x_seq.device)
+        z = x_seq.permute(1, 0, 2)                       # [B, T, D]
+        d = torch.cdist(z, z, p=2)                        # [B, T, T] latent distances
+        idx = torch.arange(T, device=x_seq.device)
+        gap = (idx[:, None] - idx[None, :]).abs()         # [T, T] temporal gaps
+        valid = gap[:, :, None] < gap[:, None, :]         # [T(a), T(p), T(n)]
+        if not valid.any():
+            return torch.zeros((), device=x_seq.device)
+        d_ap = d[:, :, :, None]                            # [B, T, T(p), 1]
+        d_an = d[:, :, None, :]                            # [B, T, 1, T(n)]
+        # want d_an - d_ap > 0 ; logistic ranking, averaged over valid triplets & batch
+        rank = -F.logsigmoid(d_an - d_ap)                  # [B, T, T, T]
+        return rank[:, valid].mean()
 
     def _sigreg(self, x):
         """SIGReg anti-collapse term (LeJEPA): push the batch marginal toward an

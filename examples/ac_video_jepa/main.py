@@ -243,6 +243,7 @@ def run(
         reg_type=cfg.model.regularizer.get("reg_type", "vicreg"),
         sigreg_coeff=cfg.model.regularizer.get("sigreg_coeff", 0.0),
         sigreg_num_slices=cfg.model.regularizer.get("sigreg_num_slices", 256),
+        tdist_coeff=cfg.model.regularizer.get("tdist_coeff", 0.0),
     )
     ploss = SquareLossSeq()
     jepa = JEPA(encoder, aencoder, predictor, regularizer, ploss).to(device)
