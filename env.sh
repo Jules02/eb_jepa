@@ -71,6 +71,8 @@ export EBJEPA_SLURM_PARTITION=${EBJEPA_SLURM_PARTITION:-defq}
 export EBJEPA_SLURM_GPUS=${EBJEPA_SLURM_GPUS:-1}
 export EBJEPA_SLURM_CPUS=${EBJEPA_SLURM_CPUS:-8}
 export EBJEPA_SLURM_TIME_MIN=${EBJEPA_SLURM_TIME_MIN:-120}
+# SLURM reservation for the Vivatech event. Override (or set empty) to disable.
+export EBJEPA_SLURM_RESERVATION=${EBJEPA_SLURM_RESERVATION:-Vivatech}
 # Memory request. EMPTY by default: the HTW DALIA scheduler FORBIDS --mem/--mem-per-gpu
 # (it rejects the job) and allocates memory proportional to the requested cores. Only set
 # this (e.g. 220G) on a different cluster that requires an explicit per-GPU memory request.

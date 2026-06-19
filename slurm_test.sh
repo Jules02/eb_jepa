@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=eb_jepa_test
 #SBATCH --partition=defq
+#SBATCH --reservation=Vivatech
 # No hardcoded --account: SLURM uses your DEFAULT account (your team allocation), so this
 # works on any team. Override with: sbatch --account=<acct> slurm_test.sh
 #SBATCH --nodes=1
