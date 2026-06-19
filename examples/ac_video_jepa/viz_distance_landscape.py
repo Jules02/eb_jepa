@@ -112,8 +112,10 @@ def run(
     # s_0 (pixel coords x,y). Default = center of the image.
     if s0 is None:
         s0_xy = [img_size / 2.0, img_size / 2.0]
+    elif isinstance(s0, (tuple, list)):
+        s0_xy = [float(v) for v in s0]            # fire parses "18,32" into a tuple
     else:
-        s0_xy = [float(v) for v in str(s0).split(",")]
+        s0_xy = [float(v) for v in str(s0).strip("()[]").split(",")]
     s0_t = torch.tensor(s0_xy, device=device, dtype=torch.float32)
 
     # Set up the (fixed) wall layout directly. We avoid env.reset(location=...) because
