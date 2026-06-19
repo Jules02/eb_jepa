@@ -564,6 +564,7 @@ if __name__ == "__main__":
         "cpus_per_task",
         "time_min",
         "gpus_per_node",
+        "reservation",
     }
     overrides = {
         k: v for k, v in vars(args).items() if v is not None and k not in excluded_keys
