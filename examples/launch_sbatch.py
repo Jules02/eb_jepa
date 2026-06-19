@@ -98,6 +98,7 @@ SLURM_DEFAULTS = {
     "gpus_per_node": int(os.environ.get("EBJEPA_SLURM_GPUS", 1)),
     "qos": os.environ.get("EBJEPA_SLURM_QOS", ""),
     "account": os.environ.get("EBJEPA_SLURM_ACCOUNT", ""),
+    "reservation": os.environ.get("EBJEPA_SLURM_RESERVATION", ""),
 }
 
 
@@ -194,6 +195,8 @@ def make_executor(
         slurm_extra["qos"] = SLURM_DEFAULTS["qos"]
     if SLURM_DEFAULTS["account"]:
         slurm_extra["account"] = SLURM_DEFAULTS["account"]
+    if SLURM_DEFAULTS["reservation"]:
+        slurm_extra["reservation"] = SLURM_DEFAULTS["reservation"]
 
     params = {
         "name": job_name,
@@ -500,6 +503,7 @@ if __name__ == "__main__":
     parser.add_argument("--cpus-per-task", type=int, help="CPUs per task (default: 8)")
     parser.add_argument("--time-min", type=int, help="Job time limit in minutes (default: 120)")
     parser.add_argument("--gpus-per-node", type=int, help="GPUs per node (default: 1)")
+    parser.add_argument("--reservation", type=str, help="SLURM reservation (default: none; or set EBJEPA_SLURM_RESERVATION)")
 
     # Common overrides
     parser.add_argument("--optim.lr", type=float)
@@ -521,6 +525,7 @@ if __name__ == "__main__":
         ("cpus_per_task", "cpus_per_task"),
         ("time_min", "timeout_min"),
         ("gpus_per_node", "gpus_per_node"),
+        ("reservation", "reservation"),
     ):
         _val = getattr(args, _cli_key)
         if _val is not None:
