@@ -240,6 +240,9 @@ def run(
         spatial_as_samples=cfg.model.regularizer.spatial_as_samples,
         idm_after_proj=cfg.model.regularizer.idm_after_proj,
         sim_t_after_proj=cfg.model.regularizer.sim_t_after_proj,
+        reg_type=cfg.model.regularizer.get("reg_type", "vicreg"),
+        sigreg_coeff=cfg.model.regularizer.get("sigreg_coeff", 0.0),
+        sigreg_num_slices=cfg.model.regularizer.get("sigreg_num_slices", 256),
     )
     ploss = SquareLossSeq()
     jepa = JEPA(encoder, aencoder, predictor, regularizer, ploss).to(device)

@@ -181,6 +181,9 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
         spatial_as_samples: bool = False,
         sim_t_after_proj: bool = False,
         idm_after_proj: bool = False,
+        reg_type: str = "vicreg",
+        sigreg_coeff: float = 0.0,
+        sigreg_num_slices: int = 256,
     ):
         """
         Composite Regularizer combining multiple losses
@@ -209,6 +212,13 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
         self.std_coeff = std_coeff
         self.sim_coeff_t = sim_coeff_t
         self.idm_coeff = idm_coeff
+
+        # Anti-collapse mode: "vicreg" (variance hinge + covariance decorrelation) or
+        # "sigreg" (LeJEPA's SIGReg: push the marginal toward an isotropic Gaussian via
+        # sliced Epps-Pulley). They are mutually exclusive; sim_t and idm terms are shared.
+        self.reg_type = reg_type
+        self.sigreg_coeff = sigreg_coeff
+        self.sigreg_num_slices = sigreg_num_slices
 
         self.first_t_only = first_t_only
         self.projector = nn.Identity() if projector is None else projector
@@ -282,25 +292,51 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
         # or [B, C_out*H*W] if first_t_only=True and spatial_as_samples=False
         # or [B*H*W, C_out] if first_t_only=True spatial_as_samples=True
         # or [B*T*H*W, C_out] if first_t_only=False spatial_as_samples=True
-        std_loss = self.std_loss_fn(x_for_vc)
-        cov_loss = self.cov_loss_fn(x_for_vc)
+        # ANTI-COLLAPSE LOSS: VICReg (std + cov) or SIGReg (sliced Epps-Pulley)
+        zero = torch.zeros((), device=x.device)
+        if self.reg_type == "sigreg":
+            sigreg_loss = self._sigreg(x_for_vc)
+            std_loss = cov_loss = zero
+            vc_weighted = self.sigreg_coeff * sigreg_loss
+        else:
+            std_loss = self.std_loss_fn(x_for_vc)
+            cov_loss = self.cov_loss_fn(x_for_vc)
+            sigreg_loss = zero
+            vc_weighted = self.cov_coeff * cov_loss + self.std_coeff * std_loss
 
         total_weighted_loss = (
-            self.cov_coeff * cov_loss
-            + self.std_coeff * std_loss
+            vc_weighted
             + self.sim_coeff_t * sim_loss_t
             + self.idm_coeff * idm_loss
         )
-        total_unweighted_loss = cov_loss + std_loss + sim_loss_t + idm_loss
+        total_unweighted_loss = (
+            cov_loss + std_loss + sigreg_loss + sim_loss_t + idm_loss
+        )
 
         loss_dict = {
             "cov_loss": cov_loss.item(),
             "std_loss": std_loss.item(),
+            "sigreg_loss": sigreg_loss.item(),
             "sim_loss_t": sim_loss_t.item(),
             "idm_loss": idm_loss if isinstance(idm_loss, float) else idm_loss.item(),
         }
 
         return total_weighted_loss, total_unweighted_loss, loss_dict
+
+    def _sigreg(self, x):
+        """SIGReg anti-collapse term (LeJEPA): push the batch marginal toward an
+        isotropic N(0, I) using sliced Epps-Pulley statistics.
+
+        Args:
+            x: [N, D] batch of embeddings.
+        Returns:
+            Scalar mean Epps-Pulley statistic over `sigreg_num_slices` random unit slices.
+        """
+        with torch.no_grad():
+            A = torch.randn(x.size(1), self.sigreg_num_slices, device=x.device)
+            A = A / (A.norm(p=2, dim=0, keepdim=True) + 1e-8)
+        views = x @ A  # [N, num_slices]
+        return epps_pulley(views).mean()
 
 
 class VICRegLoss(nn.Module):
