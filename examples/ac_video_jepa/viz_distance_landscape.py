@@ -24,6 +24,8 @@ Args:
 from pathlib import Path
 
 import fire
+import matplotlib
+matplotlib.use("Agg")  # headless compute node: render to file, no display
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -103,7 +105,8 @@ def run(
     env_config = update_config_from_yaml(
         ConfigClass, load_env_data_config("two_rooms", data_overrides)
     )
-    env = DotWall(config=env_config, fix_wall=fix_wall, normalize=False)
+    # fix_wall is read from the config (env_config.fix_wall), not a constructor kwarg
+    env = DotWall(config=env_config, normalize=False)
     img_size = env.img_size
 
     # s_0 (pixel coords x,y). Default = center of the image.
@@ -113,8 +116,13 @@ def run(
         s0_xy = [float(v) for v in str(s0).split(",")]
     s0_t = torch.tensor(s0_xy, device=device, dtype=torch.float32)
 
-    # reset() fixes the wall layout (env.wall_img / wall_x / hole_y) around s_0
-    env.reset(location=s0_t)
+    # Set up the (fixed) wall layout directly. We avoid env.reset(location=...) because
+    # that code path never sets self.target_position and then crashes in _build_info.
+    env.wall_x, env.hole_y = env._generate_wall()
+    env.left_wall_x = env.wall_x - env.wall_width // 2
+    env.right_wall_x = env.wall_x + env.wall_width // 2
+    env.wall_img = env._render_walls(env.wall_x, env.hole_y)
+    env.dot_position = s0_t
     print(f"[viz] device={device} img_size={img_size} "
           f"wall_x={float(env.wall_x):.1f} door_y={float(env.hole_y):.1f} s0={s0_xy}")
 
