@@ -19,8 +19,6 @@ Run:
 """
 import argparse
 import os
-import sys
-import types
 
 import numpy as np
 import torch
@@ -30,16 +28,10 @@ import matplotlib.pyplot as plt
 from matplotlib import animation
 from omegaconf import OmegaConf
 
-# Stub out models we don't need so the_well imports cleanly without timm
-for _mname, _cls in [
-    ("the_well.benchmark.models.afno", "AFNO"),
-    ("the_well.benchmark.models.avit", "AViT"),
-    ("the_well.benchmark.models.dilated_resnet", "DilatedResNet"),
-    ("the_well.benchmark.models.refno", "ReFNO"),
-]:
-    _m = types.ModuleType(_mname)
-    setattr(_m, _cls, type(_cls, (), {}))
-    sys.modules[_mname] = _m
+from examples.gray_scott._well_baselines import stub_heavy_well_models
+
+# Stub heavy unused models so the_well imports cleanly without timm
+stub_heavy_well_models()
 
 from eb_jepa.datasets.gray_scott.dataset import GrayScottConfig, make_loader, MEAN, STD
 from examples.gray_scott.eval import C, load_jepa, build_decoder, rollout_latents

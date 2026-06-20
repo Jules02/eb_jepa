@@ -12,22 +12,14 @@ Usage (from repo root):
          python examples/gray_scott/eval_compare.py --ckpt <jepa_checkpoint>
 """
 import argparse
-import sys
-import types
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-# Stub models we don't need to avoid timm dependency
-for _mname, _cls in [
-    ("the_well.benchmark.models.afno", "AFNO"),
-    ("the_well.benchmark.models.avit", "AViT"),
-    ("the_well.benchmark.models.dilated_resnet", "DilatedResNet"),
-    ("the_well.benchmark.models.refno", "ReFNO"),
-]:
-    _m = types.ModuleType(_mname)
-    setattr(_m, _cls, type(_cls, (), {}))
-    sys.modules[_mname] = _m
+from examples.gray_scott._well_baselines import stub_heavy_well_models
+
+# Stub heavy unused models so the_well imports without needing timm etc.
+stub_heavy_well_models()
 
 from the_well.benchmark.models.unet_classic import UNetClassic
 from the_well.benchmark.models.unet_convnext import UNetConvNext

@@ -8,23 +8,13 @@ Table 3 of the paper.  stride=1 (native 10-second steps) as in their training.
 Usage: uv run --with neuraloperator==0.3.0 --with torch-harmonics --with timm \\
            --with einops python examples/gray_scott/eval_baselines.py
 """
-import sys
-import types
 import numpy as np
 import torch
 
-# Stub out AFNO/AViT/DilatedResNet/ReFNO so the_well's __init__.py can import
-# without needing timm or other heavy deps.  We only use FNO/TFNO/UNet*.
-_STUBS = {
-    "the_well.benchmark.models.afno": "AFNO",
-    "the_well.benchmark.models.avit": "AViT",
-    "the_well.benchmark.models.dilated_resnet": "DilatedResNet",
-    "the_well.benchmark.models.refno": "ReFNO",
-}
-for _mname, _cls in _STUBS.items():
-    _m = types.ModuleType(_mname)
-    setattr(_m, _cls, type(_cls, (), {}))
-    sys.modules[_mname] = _m
+from examples.gray_scott._well_baselines import stub_heavy_well_models
+
+# Stub heavy unused models so the_well imports without needing timm etc.
+stub_heavy_well_models()
 
 from the_well.benchmark.models.fno import FNO
 from the_well.benchmark.models.tfno import TFNO
