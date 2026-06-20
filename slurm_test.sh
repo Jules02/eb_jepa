@@ -5,6 +5,7 @@
 # works on any team. Override with: sbatch --account=<acct> slurm_test.sh
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --reservation=Vivatech
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --time=00:30:00
