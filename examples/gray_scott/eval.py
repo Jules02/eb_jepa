@@ -22,6 +22,8 @@ from eb_jepa.datasets.gray_scott.dataset import GrayScottConfig, make_loader
 from examples.gray_scott.main import build_encoder, build_jepa
 
 C = 2            # context_length (StateOnlyPredictor predicts from the previous 2 frames)
+# The Well Table 3 evaluation windows (steps after context, 1-indexed)
+WELL_WINDOWS = {"6:12": (5, 12), "13:30": (12, 30)}  # (start_idx, end_idx) inclusive, 0-indexed into H
 
 
 def load_jepa(ckpt, device):
@@ -122,11 +124,12 @@ def build_decoder(dstc, device, ckpt_path=None):
 def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
     """Per-horizon field-space VRMSE for JEPA, persistence, and decoder floor.
 
-    VRMSE = sqrt(sum_space (pred-true)^2 / sum_space (true - mean_true)^2).
-    Numerators and denominators are aggregated across the full dataset before
-    taking the ratio (avoids blow-up on near-uniform frames)."""
-    num = {k: np.zeros(H) for k in ("jepa", "persistence", "floor")}
-    den = {k: np.zeros(H) for k in ("jepa", "persistence", "floor")}
+    Per The Well protocol: VRMSE is computed PER CHANNEL (u, v) separately,
+    then averaged. Numerators and denominators are aggregated across the full
+    dataset before taking the ratio (avoids blow-up on near-uniform frames)."""
+    NC = 2  # Gray-Scott has 2 chemical fields: u and v
+    num = {k: np.zeros((H, NC)) for k in ("jepa", "persistence", "floor")}
+    den = {k: np.zeros((H, NC)) for k in ("jepa", "persistence", "floor")}
 
     for batch in loader:
         x = batch["video"].to(device)                          # [B,2,C+H,H,W]
@@ -138,13 +141,14 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
 
         for h in range(H):
             true = x[:, :, C + h]                             # [B,2,H,W]
-            mu = true.mean(dim=(-2, -1), keepdim=True)
+            mu = true.mean(dim=(-2, -1), keepdim=True)         # per-sample spatial mean
             spatial_var = ((true - mu) ** 2).sum(dim=(-2, -1))  # [B,2]
 
             def _accum(name, pred_hw):
                 sq_err = ((pred_hw - true) ** 2).sum(dim=(-2, -1))  # [B,2]
-                num[name][h] += sq_err.sum().item()
-                den[name][h] += spatial_var.sum().item()
+                # sum over batch dim only — keep channels (u,v) separate
+                num[name][h] += sq_err.sum(dim=0).cpu().numpy()     # [2]
+                den[name][h] += spatial_var.sum(dim=0).cpu().numpy() # [2]
 
             _accum("jepa", pred_fields[:, :, h])
             _accum("persistence", last_ctx)
@@ -154,12 +158,21 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
             floor_field = decoder(z_true).squeeze(2)           # [B,2,H,W]
             _accum("floor", floor_field)
 
-    return {k: np.sqrt(num[k] / np.maximum(den[k], 1e-8)) for k in num}
+    # per-channel VRMSE → average across u and v (The Well protocol)
+    return {k: np.sqrt(num[k] / np.maximum(den[k], 1e-8)).mean(axis=-1)
+            for k in num}
+
+
+def window_vrmse(scores, window_name):
+    """Average VRMSE over a named window (e.g. '6:12' or '13:30')."""
+    start, end = WELL_WINDOWS[window_name]
+    end = min(end, scores[list(scores.keys())[0]].shape[0])
+    return {k: float(scores[k][start:end].mean()) for k in scores}
 
 
 def main():
     ckpt_path = sys.argv[sys.argv.index("--ckpt") + 1]
-    H = int(sys.argv[sys.argv.index("--H") + 1]) if "--H" in sys.argv else 10
+    H = int(sys.argv[sys.argv.index("--H") + 1]) if "--H" in sys.argv else 30
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -172,8 +185,19 @@ def main():
                            epoch_size=400, batch_size=8, num_workers=8)
     loader = make_loader(dcfg, shuffle=False)
     scores = vrmse_per_horizon(jepa, encoder, decoder, loader, device, H)
+
+    # Per-horizon detail
     for name, arr in scores.items():
         print(f"   {name:14s} h1={arr[0]:.3f} h{H}={arr[-1]:.3f} | {np.round(arr, 3).tolist()}", flush=True)
+
+    # The Well Table 3 windows
+    print("\n   === The Well Table 3 comparison ===", flush=True)
+    for wname in WELL_WINDOWS:
+        start, end = WELL_WINDOWS[wname]
+        if end <= H:
+            w = window_vrmse(scores, wname)
+            print(f"   window {wname}:  " +
+                  "  ".join(f"{k}={v:.3f}" for k, v in w.items()), flush=True)
 
 
 if __name__ == "__main__":
