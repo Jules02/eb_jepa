@@ -273,6 +273,8 @@ def main():
                     help="add UNetClassic + CNextU-Net panels for side-by-side comparison")
     ap.add_argument("--ckpt2", default=None,
                     help="optional second JEPA checkpoint (e.g. large model) to add as extra panel")
+    ap.add_argument("--tag", default="all",
+                    help="suffix for output gif filenames: sample{i}_compare_{tag}.gif")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -318,7 +320,7 @@ def main():
             panels = _compare_panels(truth_all[i], sample_preds)
             title = f"Gray-Scott sample {i} — stride={args.time_stride}"
             if not args.no_gif:
-                gif = os.path.join(args.outdir, f"sample{i}_compare_all.gif")
+                gif = os.path.join(args.outdir, f"sample{i}_compare_{args.tag}.gif")
                 make_compare_gif(panels, gif, title, fps=args.fps)
                 print(f"  wrote {gif}", flush=True)
         print(f"[gs-viz] done -> {args.outdir}", flush=True)
