@@ -70,52 +70,60 @@ def decode_rollout(jepa, decoder, x, H):
 
 @torch.no_grad()
 def make_ab_gif(x_base, jepa, decoder, H, regime, fk, delta, outdir, tag, fps=8):
-    """4-panel GIF: Truth | Original | A+δ | B+δ."""
+    """2-row x 4-col GIF.
+    Cols: Truth | Original | A+δ | B+δ
+    Row 0: channel A (substrate)   Row 1: channel B (activator)
+    """
     x_base = x_base.to(DEVICE)
 
-    # Ground truth future
-    truth_z  = x_base[0, :, C:C+H].cpu().numpy()       # [2,H,Hs,Ws] z-scored
-    truth_ph = _denorm(truth_z)
-
-    scale = [(float(truth_ph[0].min()), float(truth_ph[0].max())),
-             (float(truth_ph[1].min()), float(truth_ph[1].max()))]
-
-    # Predictions
-    pred_orig = _denorm(decode_rollout(jepa, decoder, x_base, H))
+    truth_ph = _denorm(x_base[0, :, C:C+H].cpu().numpy())   # [2,H,Hs,Ws]
 
     x_A = x_base.clone(); x_A[:, 0, :C] += delta
-    pred_A    = _denorm(decode_rollout(jepa, decoder, x_A, H))
-
     x_B = x_base.clone(); x_B[:, 1, :C] += delta
-    pred_B    = _denorm(decode_rollout(jepa, decoder, x_B, H))
+
+    pred_orig = _denorm(decode_rollout(jepa, decoder, x_base, H))
+    pred_A    = _denorm(decode_rollout(jepa, decoder, x_A,    H))
+    pred_B    = _denorm(decode_rollout(jepa, decoder, x_B,    H))
 
     # Latent diffs
-    z0  = rollout_latents(jepa, x_base, H, DEVICE)
-    zA  = rollout_latents(jepa, x_A,    H, DEVICE)
-    zB  = rollout_latents(jepa, x_B,    H, DEVICE)
-    dA  = ((zA - z0).norm() / z0.norm().clamp(1e-8)).item()
-    dB  = ((zB - z0).norm() / z0.norm().clamp(1e-8)).item()
+    z0 = rollout_latents(jepa, x_base, H, DEVICE)
+    zA = rollout_latents(jepa, x_A,    H, DEVICE)
+    zB = rollout_latents(jepa, x_B,    H, DEVICE)
+    dA = ((zA - z0).norm() / z0.norm().clamp(1e-8)).item()
+    dB = ((zB - z0).norm() / z0.norm().clamp(1e-8)).item()
     print(f"  {regime:10s}  ||Δz_A||/||z||={dA:.4f}  ||Δz_B||/||z||={dB:.4f}", flush=True)
 
-    panels = [
-        ("Truth",             _rgb(truth_ph, scale)),
-        ("Original pred",     _rgb(pred_orig, scale)),
-        (f"A + {delta:.1f}σ pred", _rgb(pred_A, scale)),
-        (f"B + {delta:.1f}σ pred", _rgb(pred_B, scale)),
-    ]
+    # cols: truth / orig / A+δ / B+δ   ×   rows: ch A / ch B
+    col_data  = [truth_ph, pred_orig, pred_A, pred_B]
+    col_titles = ["Truth", "Original", f"init A+{delta:.1f}σ", f"init B+{delta:.1f}σ"]
+    row_labels = ["A (substrate)", "B (activator)"]
+
+    # per-channel colour range fixed from truth
+    vmin = [float(truth_ph[ch].min()) for ch in (0, 1)]
+    vmax = [float(truth_ph[ch].max()) for ch in (0, 1)]
 
     T = H
-    fig, axes = plt.subplots(1, 4, figsize=(12, 3.4))
-    ims = []
-    for ax, (label, data) in zip(axes, panels):
-        im = ax.imshow(data[0])
-        ax.set_title(label, fontsize=9); ax.set_xticks([]); ax.set_yticks([])
-        ims.append((im, data))
+    fig, axes = plt.subplots(2, 4, figsize=(13, 6.4))
+    fig.subplots_adjust(hspace=0.08, wspace=0.04)
+
+    ims = []   # (im, data_array [H,Hs,Ws])
+    for row, ch in enumerate((0, 1)):
+        for col, data in enumerate(col_data):
+            ax = axes[row, col]
+            im = ax.imshow(data[ch, 0], cmap="viridis",
+                           vmin=vmin[ch], vmax=vmax[ch])
+            ax.set_xticks([]); ax.set_yticks([])
+            if row == 0:
+                ax.set_title(col_titles[col], fontsize=9)
+            if col == 0:
+                ax.set_ylabel(row_labels[row], fontsize=8)
+            ims.append((im, data[ch]))   # data[ch]: [H, Hs, Ws]
+
     sup = fig.suptitle("", fontsize=10)
 
     def update(f):
-        for im, data in ims:
-            im.set_data(data[f])
+        for im, frames in ims:
+            im.set_data(frames[f])
         sup.set_text(f"{regime}  F={fk[0]:.3f} k={fk[1]:.3f}   t={f+1}/{T}")
         return [im for im, _ in ims] + [sup]
 
