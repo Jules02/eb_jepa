@@ -81,6 +81,26 @@ def _encode(encoder, obs_4d, normalizer, device, batch=1024):
     return torch.cat(outs, dim=0)                    # (N, F)
 
 
+def _select_dims(z_grid, z0, dims, cfg):
+    """Restrict the embedding to a feature sub-range before computing the L2 distance.
+
+    For a maze (spatially-global latent, h=w=1) the flattened feature axis F equals the
+    channel axis C, so the regularizer's h1/h2 channel split coincides with a feature
+    slice here. ``dims`` accepts "h1"/"h2" (using cfg's dist_split_frac) or "start:end".
+    """
+    F = z_grid.shape[1]
+    if dims is None:
+        return z_grid, z0, "full"
+    if dims in ("h1", "h2"):
+        frac = float(cfg.model.regularizer.get("dist_split_frac", 0.5)) or 0.5
+        k = int(round(frac * F))
+        sl = slice(0, k) if dims == "h1" else slice(k, F)
+    else:
+        a, b = (dims.split(":") + [""])[:2]
+        sl = slice(int(a) if a else 0, int(b) if b else F)
+    return z_grid[:, sl], z0[:, sl], f"{dims} ({z_grid[:, sl].shape[1]}/{F} dims)"
+
+
 def run(
     model_folder: str,
     checkpoint: str = "latest.pth.tar",
@@ -90,6 +110,7 @@ def run(
     stride: int = 1,
     out: str = None,
     device: str = None,
+    dims: str = None,
 ):
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     folder = Path(model_folder)
@@ -140,6 +161,8 @@ def run(
     # --- encode and compute distances ---
     z_grid = _encode(encoder, obs_grid, normalizer, device)      # (N, F)
     z0 = _encode(encoder, obs0, normalizer, device)              # (1, F)
+    z_grid, z0, dim_note = _select_dims(z_grid, z0, dims, cfg)    # optional h1/h2 slice
+    print(f"[viz] dims={dim_note}")
     dist = (z_grid - z0).norm(dim=1).reshape(gh, gw).numpy()     # (gh, gw)
 
     # --- plot ---

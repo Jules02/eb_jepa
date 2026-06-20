@@ -1,0 +1,51 @@
+# Gray-Scott temporal V-JEPA — v2: encoder fix + anti-overfit + clean val measurement.
+# Differences vs train_vjepa.yaml:
+#   * model.norm: group     -> GroupNorm instead of BatchNorm (no EMA-target / small-batch
+#                              pathology). NOTE: changes the state_dict -> v1/aduplessi (BN)
+#                              checkpoints will NOT load into this model, and vice versa.
+#   * optim.weight_decay    -> AdamW regularization (the old Adam had none)
+#   * training.augment      -> exact D4 symmetry augmentation (free 8x; fights 6-regime data)
+#   * data.val_epoch_size   -> 2000-clip validation (was 80 -> noisy); + main.py now logs
+#                              val_pred_loss separately so "overfit" is measured cleanly.
+# Still NO inline VRMSE (eval_every: 0): selecting on the reported metric = cheating.
+meta:
+  seed: 0
+  ckpt_dir: /lustre/work/vivatech-jepadormi/abenmanso/checkpoints/gray_scott/vjepa_v2
+data:
+  data_root: /lustre/work/pdl17890/udl806719/datasets/the_well/gray_scott_reaction_diffusion
+  split: train
+  channels: 2
+  img_size: 128
+  n_frames: 10
+  time_stride: 4
+  epoch_size: 8000
+  batch_size: 8
+  num_workers: 8
+  val_epoch_size: 2000   # fixed-size, low-variance validation estimate
+model:
+  dobs: 2
+  henc: 32
+  dstc: 16
+  hpre: 32
+  steps: 4
+  std_coeff: 10.0
+  cov_coeff: 100.0
+  norm: group            # GroupNorm encoder + predictor (the #1 architecture fix)
+loss:
+  std_coeff: 10.0
+  cov_coeff: 100.0
+optim:
+  epochs: 30
+  lr: 1.0e-3
+  weight_decay: 1.0e-4   # AdamW regularization (anti-overfit)
+training:
+  use_amp: true
+  dtype: bfloat16
+  augment: true          # D4 spatial symmetries (rot90 + flips) — exact for isotropic GS
+logging:
+  log_every: 50
+  save_every: 1          # keep every epoch -> select post-hoc on val_pred_loss
+  eval_every: 0          # NO inline VRMSE (no peeking at the reported metric)
+  log_wandb: true
+  wandb_project: eb_jepa
+  wandb_run_name: gray_scott_vjepa_v2
