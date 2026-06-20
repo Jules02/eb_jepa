@@ -98,7 +98,7 @@ SLURM_DEFAULTS = {
     "gpus_per_node": int(os.environ.get("EBJEPA_SLURM_GPUS", 1)),
     "qos": os.environ.get("EBJEPA_SLURM_QOS", ""),
     "account": os.environ.get("EBJEPA_SLURM_ACCOUNT", ""),
-    "reservation": os.environ.get("EBJEPA_SLURM_RESERVATION", ""),
+    "reservation": os.environ.get("EBJEPA_SLURM_RESERVATION", "Vivatech"),  # shared event reservation, same for everyone (set empty to disable)
 }
 
 
