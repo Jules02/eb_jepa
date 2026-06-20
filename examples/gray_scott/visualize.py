@@ -55,10 +55,14 @@ def _denorm(field, ch):
 
 
 def _denorm_arr(arr):
-    """[2,T,H,W] numpy -> physical units both channels."""
+    """numpy array with channel dim=0 ([2,T,H,W]) or dim=1 ([B,2,T,H,W]) -> physical units."""
     out = arr.copy()
-    for ch in (0, 1):
-        out[ch] = _denorm(arr[ch], ch)
+    if arr.ndim == 4:           # [2, T, H, W]
+        for ch in (0, 1):
+            out[ch] = _denorm(arr[ch], ch)
+    else:                        # [B, 2, T, H, W]
+        for ch in (0, 1):
+            out[:, ch] = _denorm(arr[:, ch], ch)
     return out
 
 
@@ -97,37 +101,41 @@ def _unet_rollout(model, x_ctx, H):
     return torch.cat(preds, dim=1)                       # [B, H, NC, Hs, Ws]
 
 
-@torch.no_grad()
-def predict_clip_compare(jepa, encoder, decoder, unet, cnext, x, H, device):
-    """Predictions for JEPA + both UNet baselines, aligned to the same future window.
+def _jepa_aligned_pred(jepa, decoder, x, H, device):
+    """Run one JEPA rollout and return predictions aligned to the UNet future window.
 
-    x: [B, 2, C_UNET+H, Hs, Ws]  (loaded with n_frames = C_UNET + H)
-    Returns truth, jepa_pred, unet_pred, cnext_pred each [B, 2, H, Hs, Ws] numpy (physical units).
+    Returns [B, 2, H, Hs, Ws] numpy array in normalised space (before denorm).
+    """
+    H_jepa = (C_UNET - C) + H
+    pred_z = rollout_latents(jepa, x, H_jepa, device)   # [B,D,C+H_jepa,h,w]
+    jepa_future = decoder(pred_z[:, :, C:])              # [B,2,H_jepa,Hs,Ws]
+    return jepa_future[:, :, (C_UNET - C):]             # [B,2,H,Hs,Ws]
+
+
+@torch.no_grad()
+def predict_clip_compare(jepa_models, unet, cnext, x, H, device):
+    """Predictions for one or more JEPA models + both UNet baselines.
+
+    jepa_models: list of (label, jepa, decoder) tuples
+    x: [B, 2, C_UNET+H, Hs, Ws]
+    Returns: truth [B,2,H,Hs,Ws], list of (label, pred [B,2,H,Hs,Ws]) — all numpy, physical units.
     The shared future window is frames [C_UNET, C_UNET+H) in absolute time.
     """
-    # JEPA: context = first C=2 frames; need (C_UNET-C)+H extra steps to reach same window
-    H_jepa = (C_UNET - C) + H
-    pred_z = rollout_latents(jepa, x, H_jepa, device)       # [B,D,C+H_jepa,h,w]
-    jepa_future = decoder(pred_z[:, :, C:])                  # [B,2,H_jepa,Hs,Ws]
-    jepa_aligned = jepa_future[:, :, (C_UNET - C):]         # [B,2,H,Hs,Ws]
-
-    # UNet: context = first C_UNET=4 frames
-    x_cl = x.permute(0, 2, 3, 4, 1)                         # [B,T,Hs,Ws,2]
-    unet_preds = _unet_rollout(unet,  x_cl[:, :C_UNET], H)  # [B,H,2,Hs,Ws]
-    cnext_preds = _unet_rollout(cnext, x_cl[:, :C_UNET], H) # [B,H,2,Hs,Ws]
-
-    truth_future = x[:, :, C_UNET:C_UNET + H]               # [B,2,H,Hs,Ws]
-
     def to_np(t):
-        return t.cpu().numpy()
+        return _denorm_arr(t.cpu().numpy())
 
-    return (
-        _denorm_arr(to_np(truth_future).transpose(0, 1, 2, 3, 4)
-                    .reshape(x.shape[0], 2, H, *x.shape[-2:])),
-        _denorm_arr(to_np(jepa_aligned)),
-        _denorm_arr(to_np(unet_preds.permute(0, 2, 1, 3, 4))),
-        _denorm_arr(to_np(cnext_preds.permute(0, 2, 1, 3, 4))),
-    )
+    truth_future = x[:, :, C_UNET:C_UNET + H]
+
+    preds = []
+    for label, jepa, decoder in jepa_models:
+        aligned = _jepa_aligned_pred(jepa, decoder, x, H, device)
+        preds.append((label, to_np(aligned)))
+
+    x_cl = x.permute(0, 2, 3, 4, 1)
+    preds.append(("UNetClassic", to_np(_unet_rollout(unet,  x_cl[:, :C_UNET], H).permute(0, 2, 1, 3, 4))))
+    preds.append(("CNextU-Net",  to_np(_unet_rollout(cnext, x_cl[:, :C_UNET], H).permute(0, 2, 1, 3, 4))))
+
+    return to_np(truth_future), preds
 
 
 def _norm01(x, lo, hi):
@@ -161,20 +169,19 @@ def _panels(truth, pred, mode, ch=None):
             ("|error|", err, dict(cmap="magma", vmin=0.0, vmax=emax))]
 
 
-def _compare_panels(truth, jepa, unet, cnext):
-    """4-panel RGB comparison: Truth | JEPA | UNetClassic | CNextU-Net.
+def _compare_panels(truth, preds):
+    """RGB comparison panels: Truth + one panel per model in preds.
 
-    All inputs: [2, H, Hs, Ws] numpy (physical units, H = time axis).
-    Returns list of (label, [H, Hs, Ws, 3], {}) panels.
+    truth: [2, T, Hs, Ws] numpy (physical units)
+    preds: list of (label, [2, T, Hs, Ws]) numpy arrays
+    Returns list of (label, [T, Hs, Ws, 3], {}) panels.
     """
     scale = [(float(truth[0].min()), float(truth[0].max())),
              (float(truth[1].min()), float(truth[1].max()))]
-    return [
-        ("Truth (R=A, G=B)", _rgb(truth, scale), {}),
-        ("JEPA",             _rgb(jepa,  scale), {}),
-        ("UNetClassic",      _rgb(unet,  scale), {}),
-        ("CNextU-Net",       _rgb(cnext, scale), {}),
-    ]
+    panels = [("Truth (R=A, G=B)", _rgb(truth, scale), {})]
+    for label, pred in preds:
+        panels.append((label, _rgb(pred, scale), {}))
+    return panels
 
 
 def filmstrip(panels, sample_path, title):
@@ -264,6 +271,8 @@ def main():
     ap.add_argument("--no-gif", action="store_true", help="skip the animated GIFs")
     ap.add_argument("--baselines", action="store_true",
                     help="add UNetClassic + CNextU-Net panels for side-by-side comparison")
+    ap.add_argument("--ckpt2", default=None,
+                    help="optional second JEPA checkpoint (e.g. large model) to add as extra panel")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -284,20 +293,32 @@ def main():
         cnext = UNetConvNext.from_pretrained(f"polymathic-ai/UNetConvNext-{HF_SUFFIX}").to(device).eval()
         print("[gs-viz] loaded UNetClassic and CNextU-Net", flush=True)
 
+        # Build JEPA model list — always include primary ckpt, optionally a second
+        ep1 = ckpt.get("epoch")
+        jepa_models = [(f"JEPA-small (ep{ep1})", jepa, decoder)]
+        if args.ckpt2:
+            ckpt2 = torch.load(args.ckpt2, map_location=device, weights_only=False)
+            jepa2, _ = load_jepa(ckpt2, device)
+            dstc2 = int(OmegaConf.create(ckpt2["cfg"]).model.dstc)
+            decoder2 = build_decoder(dstc2, device, ckpt_path=args.ckpt2)
+            ep2 = ckpt2.get("epoch")
+            jepa_models.append((f"JEPA-large D={dstc2} (ep{ep2})", jepa2, decoder2))
+            print(f"[gs-viz] loaded second ckpt (epoch {ep2}, D={dstc2})", flush=True)
+
         n_frames = C_UNET + args.H
         dcfg = GrayScottConfig(split="valid", n_frames=n_frames, time_stride=args.time_stride,
                                epoch_size=args.n, batch_size=args.n, num_workers=2)
         loader = make_loader(dcfg, shuffle=False)
-        x = next(iter(loader))["video"].to(device)   # [n, 2, C_UNET+H, Hs, Ws]
+        x = next(iter(loader))["video"].to(device)
 
-        results = predict_clip_compare(jepa, encoder, decoder, unet, cnext, x, args.H, device)
-        truth_all, jepa_all, unet_all, cnext_all = results
+        truth_all, preds_all = predict_clip_compare(jepa_models, unet, cnext, x, args.H, device)
 
         for i in range(truth_all.shape[0]):
-            panels = _compare_panels(truth_all[i], jepa_all[i], unet_all[i], cnext_all[i])
-            title = f"Gray-Scott sample {i} — ep{ckpt.get('epoch')} stride={args.time_stride}"
+            sample_preds = [(lbl, p[i]) for lbl, p in preds_all]
+            panels = _compare_panels(truth_all[i], sample_preds)
+            title = f"Gray-Scott sample {i} — stride={args.time_stride}"
             if not args.no_gif:
-                gif = os.path.join(args.outdir, f"sample{i}_compare.gif")
+                gif = os.path.join(args.outdir, f"sample{i}_compare_all.gif")
                 make_compare_gif(panels, gif, title, fps=args.fps)
                 print(f"  wrote {gif}", flush=True)
         print(f"[gs-viz] done -> {args.outdir}", flush=True)
