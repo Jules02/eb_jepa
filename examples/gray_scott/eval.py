@@ -131,14 +131,11 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
     Final score = mean over samples (mean-of-ratios), then averaged over channels.
     Also returns per-channel '_u' and '_v' diagnostic keys."""
     NC = 2
-    EPS = 1e-6
-    vrmse_acc = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
-    n_total = 0
+    num = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
+    den = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
 
     for batch in loader:
         x = batch["video"].to(device)                            # [B,2,C+H,H,W]
-        B = x.shape[0]
-        n_total += B
         last_ctx = x[:, :, C - 1]                               # [B,2,H,W]
 
         pred_z = rollout_latents(jepa, x, H, device)            # [B,D,C+H,h,w]
@@ -147,11 +144,13 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
         for h in range(H):
             true = x[:, :, C + h]                               # [B,2,H,W]
             mu = true.mean(dim=(-2, -1), keepdim=True)
-            spatial_var = ((true - mu) ** 2).sum(dim=(-2, -1)).cpu().numpy()  # [B,2]
+            spatial_var = ((true - mu) ** 2).sum(dim=(-2, -1))  # [B,2]
 
             def _accum(name, pred_hw):
-                sq_err = ((pred_hw - true) ** 2).sum(dim=(-2, -1)).cpu().numpy()  # [B,2]
-                vrmse_acc[name][h] += np.sqrt(sq_err / (spatial_var + EPS)).sum(axis=0)  # [2]
+                sq_err = ((pred_hw - true) ** 2).sum(dim=(-2, -1))  # [B,2]
+                # sum over batch, keep channels separate (pooled per channel)
+                num[name][h] += sq_err.sum(dim=0).cpu().numpy()       # [2]
+                den[name][h] += spatial_var.sum(dim=0).cpu().numpy()  # [2]
 
             _accum("jepa", pred_fields[:, :, h])
             _accum("persistence", last_ctx)
@@ -160,8 +159,8 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
             floor_field = decoder(z_true).squeeze(2)             # [B,2,H,W]
             _accum("floor", floor_field)
 
-    # mean-of-ratios: (H,2) → headline = channel average (H,); also expose u,v
-    per_ch = {k: vrmse_acc[k] / max(n_total, 1) for k in _HEADLINE_KEYS}
+    # pooled ratio per channel → average across channels
+    per_ch = {k: np.sqrt(num[k] / np.maximum(den[k], 1e-8)) for k in _HEADLINE_KEYS}
     result = {k: per_ch[k].mean(axis=-1) for k in _HEADLINE_KEYS}
     for k in _HEADLINE_KEYS:
         result[f"{k}_u"] = per_ch[k][:, 0]
