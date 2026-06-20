@@ -103,8 +103,9 @@ def make_ab_gif(x_base, jepa, decoder, H, regime, fk, delta, outdir, tag, fps=8)
     vmax = [float(truth_ph[ch].max()) for ch in (0, 1)]
 
     T = H
-    fig, axes = plt.subplots(2, 4, figsize=(13, 6.4))
-    fig.subplots_adjust(hspace=0.08, wspace=0.04)
+    fig, axes = plt.subplots(2, 4, figsize=(13, 9))
+    fig.subplots_adjust(hspace=0.35, wspace=0.05, top=0.88, bottom=0.04,
+                        left=0.07, right=0.99)
 
     ims = []   # (im, data_array [H,Hs,Ws])
     for row, ch in enumerate((0, 1)):
@@ -114,12 +115,16 @@ def make_ab_gif(x_base, jepa, decoder, H, regime, fk, delta, outdir, tag, fps=8)
                            vmin=vmin[ch], vmax=vmax[ch])
             ax.set_xticks([]); ax.set_yticks([])
             if row == 0:
-                ax.set_title(col_titles[col], fontsize=9)
-            if col == 0:
-                ax.set_ylabel(row_labels[row], fontsize=8)
+                ax.set_title(col_titles[col], fontsize=10, fontweight="bold")
             ims.append((im, data[ch]))   # data[ch]: [H, Hs, Ws]
 
-    sup = fig.suptitle("", fontsize=10)
+    # Prominent row labels on the left
+    fig.text(0.01, 0.72, "A  (substrate)", va="center", ha="left",
+             fontsize=12, fontweight="bold", rotation=90, color="#1f77b4")
+    fig.text(0.01, 0.27, "B  (activator)", va="center", ha="left",
+             fontsize=12, fontweight="bold", rotation=90, color="#2ca02c")
+
+    sup = fig.suptitle("", fontsize=11)
 
     def update(f):
         for im, frames in ims:
