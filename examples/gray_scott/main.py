@@ -80,25 +80,38 @@ def _run_inline_eval(jepa, encoder, cfg, device, wandb_run, epoch, gstep,
         decoder_opt.step()
     decoder.eval()
     scores = vrmse_per_horizon(jepa, encoder, decoder, eval_loader, device, H)
-    for name, arr in scores.items():
+    from examples.gray_scott.eval import _HEADLINE_KEYS
+    for name in _HEADLINE_KEYS:
+        arr = scores[name]
         print(f"[eval-e{epoch}] {name:14s} h1={arr[0]:.3f} h{H}={arr[-1]:.3f}", flush=True)
+    for name in ("jepa", "floor"):
+        for ch in ("u", "v"):
+            arr = scores[f"{name}_{ch}"]
+            print(f"[eval-e{epoch}] {name}_{ch:11s} h1={arr[0]:.3f} h{H}={arr[-1]:.3f}", flush=True)
     # The Well Table 3 windowed summary
     for wname, (start, end) in WELL_WINDOWS.items():
         if end <= H:
             w = window_vrmse(scores, wname)
-            print(f"[eval-e{epoch}] window {wname}: " +
-                  "  ".join(f"{k}={v:.3f}" for k, v in w.items()), flush=True)
+            headline = "  ".join(f"{k}={w[k]:.3f}" for k in _HEADLINE_KEYS)
+            print(f"[eval-e{epoch}] window {wname}: {headline}", flush=True)
+            print(f"[eval-e{epoch}]   jepa_u={w['jepa_u']:.3f}  jepa_v={w['jepa_v']:.3f}", flush=True)
     if wandb_run:
         import wandb
         log_dict = {}
         for h in range(H):
-            for name in scores:
+            for name in _HEADLINE_KEYS:
                 log_dict[f"eval/vrmse_{name}_h{h+1}"] = scores[name][h]
+            for name in ("jepa", "floor"):
+                for ch in ("u", "v"):
+                    log_dict[f"eval/vrmse_{name}_{ch}_h{h+1}"] = scores[f"{name}_{ch}"][h]
         for wname, (start, end) in WELL_WINDOWS.items():
             if end <= H:
                 w = window_vrmse(scores, wname)
-                for name, val in w.items():
-                    log_dict[f"eval/vrmse_{name}_w{wname.replace(':','_')}"] = val
+                for name in _HEADLINE_KEYS:
+                    log_dict[f"eval/vrmse_{name}_w{wname.replace(':','_')}"] = w[name]
+                for name in ("jepa", "floor"):
+                    for ch in ("u", "v"):
+                        log_dict[f"eval/vrmse_{name}_{ch}_w{wname.replace(':','_')}"] = w[f"{name}_{ch}"]
         wandb.log(log_dict, step=gstep)
     jepa.train()
 
