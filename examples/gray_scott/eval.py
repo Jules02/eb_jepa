@@ -125,14 +125,14 @@ _HEADLINE_KEYS = ("jepa", "persistence", "floor")
 
 @torch.no_grad()
 def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
-    """Per-horizon VRMSE using The Well's mean-of-ratios protocol.
+    """Per-horizon VRMSE using the paper's exact formula (mean-of-ratios).
 
-    For each sample: vrmse_i = sqrt(sq_err_i / (spatial_var_i + ε)) per channel.
-    Final score = mean over samples (mean-of-ratios), then averaged over channels.
+    Per sample and channel: sqrt(mean_space((pred-true)²) / (var_space(true) + 1e-7)).
+    Final score = mean over samples, then averaged over channels.
     Also returns per-channel '_u' and '_v' diagnostic keys."""
     NC = 2
-    num = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
-    den = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
+    psum = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
+    pcnt = np.zeros(H)
 
     for batch in loader:
         x = batch["video"].to(device)                            # [B,2,C+H,H,W]
@@ -143,14 +143,12 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
 
         for h in range(H):
             true = x[:, :, C + h]                               # [B,2,H,W]
-            mu = true.mean(dim=(-2, -1), keepdim=True)
-            spatial_var = ((true - mu) ** 2).sum(dim=(-2, -1))  # [B,2]
+            true_var = true.var(dim=(-2, -1))                    # [B,2]
 
             def _accum(name, pred_hw):
-                sq_err = ((pred_hw - true) ** 2).sum(dim=(-2, -1))  # [B,2]
-                # sum over batch, keep channels separate (pooled per channel)
-                num[name][h] += sq_err.sum(dim=0).cpu().numpy()       # [2]
-                den[name][h] += spatial_var.sum(dim=0).cpu().numpy()  # [2]
+                mse = ((pred_hw - true) ** 2).mean(dim=(-2, -1))     # [B,2]
+                pv = torch.sqrt(mse / (true_var + 1e-7))              # [B,2]
+                psum[name][h] += pv.sum(dim=0).cpu().numpy()
 
             _accum("jepa", pred_fields[:, :, h])
             _accum("persistence", last_ctx)
@@ -158,9 +156,9 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
             z_true = encoder(true.unsqueeze(2))                  # [B,D,1,H,W]
             floor_field = decoder(z_true).squeeze(2)             # [B,2,H,W]
             _accum("floor", floor_field)
+            pcnt[h] += true.shape[0]
 
-    # pooled ratio per channel → average across channels
-    per_ch = {k: np.sqrt(num[k] / np.maximum(den[k], 1e-8)) for k in _HEADLINE_KEYS}
+    per_ch = {k: psum[k] / np.maximum(pcnt[:, None], 1) for k in _HEADLINE_KEYS}
     result = {k: per_ch[k].mean(axis=-1) for k in _HEADLINE_KEYS}
     for k in _HEADLINE_KEYS:
         result[f"{k}_u"] = per_ch[k][:, 0]
