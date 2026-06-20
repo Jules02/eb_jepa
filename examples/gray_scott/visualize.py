@@ -41,6 +41,7 @@ for _mname, _cls in [
     setattr(_m, _cls, type(_cls, (), {}))
     sys.modules[_mname] = _m
 
+from eb_jepa.architectures import ResUNet
 from eb_jepa.datasets.gray_scott.dataset import GrayScottConfig, make_loader, MEAN, STD
 from examples.gray_scott.eval import C, load_jepa, build_decoder, rollout_latents
 
@@ -134,6 +135,48 @@ def predict_clip_compare(jepa_models, unet, cnext, x, H, device):
     x_cl = x.permute(0, 2, 3, 4, 1)
     preds.append(("UNetClassic", to_np(_unet_rollout(unet,  x_cl[:, :C_UNET], H).permute(0, 2, 1, 3, 4))))
     preds.append(("CNextU-Net",  to_np(_unet_rollout(cnext, x_cl[:, :C_UNET], H).permute(0, 2, 1, 3, 4))))
+
+    return to_np(truth_future), preds
+
+
+@torch.no_grad()
+def _field_rollout_c2(model, x, H):
+    """Autoregressive rollout for field-space models with C=2 context.
+
+    x: [B, 2, C+H, Hs, Ws]; returns [B, 2, H, Hs, Ws] — all z-scored.
+    """
+    preds = []
+    ctx = x[:, :, :C].clone()                    # [B, 2, C, Hs, Ws]
+    for _ in range(H):
+        inp = ctx.flatten(1, 2)                   # [B, 2*C=4, Hs, Ws]
+        out = model(inp)                          # [B, 2, Hs, Ws]
+        preds.append(out.unsqueeze(2))
+        ctx = torch.cat([ctx[:, :, 1:], out.unsqueeze(2)], dim=2)
+    return torch.cat(preds, dim=2)               # [B, 2, H, Hs, Ws]
+
+
+@torch.no_grad()
+def predict_clip_compare_s4(jepa_models, field_models, x, H, device):
+    """Predictions for JEPA models + stride-4 field-space baselines (all C=2 context).
+
+    jepa_models: list of (label, jepa, decoder)
+    field_models: list of (label, model)
+    x: [B, 2, C+H, Hs, Ws]
+    Returns: truth [B,2,H,Hs,Ws], list of (label, pred [B,2,H,Hs,Ws]) — numpy, physical units.
+    """
+    def to_np(t):
+        return _denorm_arr(t.cpu().numpy())
+
+    truth_future = x[:, :, C:C + H]             # [B, 2, H, Hs, Ws]
+
+    preds = []
+    for label, jepa, decoder in jepa_models:
+        pred_z = rollout_latents(jepa, x, H, device)
+        jepa_future = decoder(pred_z[:, :, C:])  # [B, 2, H, Hs, Ws]
+        preds.append((label, to_np(jepa_future)))
+
+    for label, model in field_models:
+        preds.append((label, to_np(_field_rollout_c2(model, x, H))))
 
     return to_np(truth_future), preds
 
@@ -273,8 +316,12 @@ def main():
     ap.add_argument("--no-gif", action="store_true", help="skip the animated GIFs")
     ap.add_argument("--baselines", action="store_true",
                     help="add UNetClassic + CNextU-Net panels for side-by-side comparison")
+    ap.add_argument("--baselines-s4", action="store_true",
+                    help="add stride-4 ResUNet + FNO panels (weights from EBJEPA_CKPTS)")
     ap.add_argument("--ckpt2", default=None,
-                    help="optional second JEPA checkpoint (e.g. large model) to add as extra panel")
+                    help="optional second JEPA checkpoint to add as extra panel")
+    ap.add_argument("--label2", default=None,
+                    help="display label for --ckpt2 panel (default: inferred from checkpoint)")
     ap.add_argument("--tag", default="all",
                     help="suffix for output gif filenames: sample{i}_compare_{tag}.gif")
     args = ap.parse_args()
@@ -289,6 +336,53 @@ def main():
     decoder = build_decoder(dstc, device, ckpt_path=args.ckpt)
     print(f"[gs-viz] loaded ckpt (epoch {ckpt.get('epoch')}), H={args.H}, "
           f"n={args.n}, baselines={args.baselines}, device={device}", flush=True)
+
+    if args.baselines_s4:
+        from examples.gray_scott.baselines import FNO2d, baseline_weights_path
+
+        unet_s4 = ResUNet(in_d=2 * C, h_d=32, out_d=2, norm="group").to(device)
+        unet_s4.load_state_dict(torch.load(baseline_weights_path(args.time_stride, "unet"),
+                                           map_location=device))
+        unet_s4.eval()
+
+        fno_s4 = FNO2d(in_c=2 * C, out_c=2, width=32, modes=16, n_layers=4).to(device)
+        fno_s4.load_state_dict(torch.load(baseline_weights_path(args.time_stride, "fno"),
+                                          map_location=device))
+        fno_s4.eval()
+        print("[gs-viz] loaded stride=4 ResUNet and FNO baselines", flush=True)
+
+        ep1 = ckpt.get("epoch")
+        jepa_models = [(f"JEPA-small (ep{ep1})", jepa, decoder)]
+        if args.ckpt2:
+            ckpt2 = torch.load(args.ckpt2, map_location=device, weights_only=False)
+            jepa2, _ = load_jepa(ckpt2, device)
+            dstc2 = int(OmegaConf.create(ckpt2["cfg"]).model.dstc)
+            decoder2 = build_decoder(dstc2, device, ckpt_path=args.ckpt2)
+            ep2 = ckpt2.get("epoch")
+            label2 = args.label2 if args.label2 else f"JEPA-2 D={dstc2} (ep{ep2})"
+            jepa_models.append((label2, jepa2, decoder2))
+            print(f"[gs-viz] loaded second ckpt (epoch {ep2}, D={dstc2})", flush=True)
+
+        field_models = [("ResUNet-s4", unet_s4), ("FNO-s4", fno_s4)]
+
+        n_frames = C + args.H
+        dcfg = GrayScottConfig(split="valid", n_frames=n_frames, time_stride=args.time_stride,
+                               epoch_size=args.n, batch_size=args.n, num_workers=2)
+        loader = make_loader(dcfg, shuffle=False)
+        x = next(iter(loader))["video"].to(device)
+
+        truth_all, preds_all = predict_clip_compare_s4(jepa_models, field_models, x, args.H, device)
+
+        for i in range(truth_all.shape[0]):
+            sample_preds = [(lbl, p[i]) for lbl, p in preds_all]
+            panels = _compare_panels(truth_all[i], sample_preds)
+            title = f"Gray-Scott sample {i} — stride={args.time_stride}"
+            if not args.no_gif:
+                gif = os.path.join(args.outdir, f"sample{i}_compare_{args.tag}.gif")
+                make_compare_gif(panels, gif, title, fps=args.fps)
+                print(f"  wrote {gif}", flush=True)
+        print(f"[gs-viz] done -> {args.outdir}", flush=True)
+        return
 
     if args.baselines:
         from the_well.benchmark.models.unet_classic import UNetClassic
@@ -306,7 +400,8 @@ def main():
             dstc2 = int(OmegaConf.create(ckpt2["cfg"]).model.dstc)
             decoder2 = build_decoder(dstc2, device, ckpt_path=args.ckpt2)
             ep2 = ckpt2.get("epoch")
-            jepa_models.append((f"JEPA-large D={dstc2} (ep{ep2})", jepa2, decoder2))
+            label2 = args.label2 if args.label2 else f"JEPA-2 D={dstc2} (ep{ep2})"
+            jepa_models.append((label2, jepa2, decoder2))
             print(f"[gs-viz] loaded second ckpt (epoch {ep2}, D={dstc2})", flush=True)
 
         n_frames = C_UNET + args.H

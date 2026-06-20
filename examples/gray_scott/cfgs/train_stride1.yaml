@@ -1,0 +1,37 @@
+meta:
+  seed: 0
+  ckpt_dir: /lustre/work/vivatech-jepadormi/aduplessi/checkpoints/gray_scott/stride1
+data:
+  data_root: /lustre/work/pdl17890/udl806719/datasets/the_well/gray_scott_reaction_diffusion
+  split: train
+  channels: 2
+  img_size: 128
+  n_frames: 10
+  time_stride: 1
+  epoch_size: 8000
+  batch_size: 8
+  num_workers: 8
+model:
+  dobs: 2
+  henc: 32
+  dstc: 16
+  hpre: 32
+  steps: 4
+  std_coeff: 10.0
+  cov_coeff: 100.0
+loss:
+  std_coeff: 10.0
+  cov_coeff: 100.0
+optim:
+  epochs: 20
+  lr: 1.0e-3
+training:
+  use_amp: true
+  dtype: bfloat16
+logging:
+  log_every: 50
+  save_every: 5
+  eval_every: 0
+  log_wandb: true
+  wandb_project: eb_jepa
+  wandb_run_name: gray_scott_stride1
