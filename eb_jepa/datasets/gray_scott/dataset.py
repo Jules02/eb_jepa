@@ -12,7 +12,9 @@ Data loading is PROVIDED (plumbing). The modelling choices on top of these clips
 """
 import glob
 import os
+import re
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -28,6 +30,30 @@ MEAN = np.array([0.729227819893941, 0.09658732411527585], dtype=np.float32)
 STD = np.array([0.23988766176449572, 0.12366442840472558], dtype=np.float32)
 NT = 1001  # timesteps per trajectory
 
+# Each HDF5 file is ONE F,k regime; the regime name + parameters are in the
+# filename, e.g. ``..._gray_scott_reaction_diffusion_bubbles_F_0.098_k_0.057.hdf5``.
+# The Well documents 6 such regimes (see the dataset README / polymathic-ai.org).
+_REGIME_RE = re.compile(r"diffusion_([a-z]+)_F_([0-9.]+)_k_([0-9.]+)\.hdf5$")
+
+
+def parse_regime(path):
+    """``path`` -> ``(name, F, k)`` parsed from the filename, or ``None``."""
+    m = _REGIME_RE.search(os.path.basename(path))
+    if not m:
+        return None
+    return m.group(1), float(m.group(2)), float(m.group(3))
+
+
+def list_regimes(split="valid", data_root=ROOT):
+    """Map regime name -> (F, k) for every file in ``split`` (sorted by name)."""
+    files = sorted(glob.glob(os.path.join(data_root, "data", split, "*.hdf5")))
+    out = {}
+    for p in files:
+        r = parse_regime(p)
+        if r is not None:
+            out[r[0]] = (r[1], r[2])
+    return dict(sorted(out.items()))
+
 
 @dataclass
 class GrayScottConfig:
@@ -40,6 +66,7 @@ class GrayScottConfig:
     epoch_size: int = 8000
     batch_size: int = 8
     num_workers: int = 8
+    regime: Optional[str] = None  # restrict to one regime (e.g. "bubbles"); None = all
 
 
 class GrayScottDataset(torch.utils.data.Dataset):
@@ -48,9 +75,13 @@ class GrayScottDataset(torch.utils.data.Dataset):
             raise ImportError("h5py required (uv pip install h5py)")
         self.cfg = cfg
         self.files = sorted(glob.glob(os.path.join(cfg.data_root, "data", cfg.split, "*.hdf5")))
+        if cfg.regime is not None:  # keep only the file(s) for this F,k regime
+            self.files = [p for p in self.files if f"_{cfg.regime}_" in os.path.basename(p)]
         if not self.files:
+            where = os.path.join(cfg.data_root, "data", cfg.split)
+            extra = f" for regime '{cfg.regime}'" if cfg.regime else ""
             raise FileNotFoundError(
-                f"No .hdf5 in {os.path.join(cfg.data_root, 'data', cfg.split)} — "
+                f"No .hdf5 in {where}{extra} — "
                 "download the dataset first (see examples/gray_scott/README.md).")
         # (file -> n_traj) index — read n_traj cheaply from the header
         self.ntraj = []

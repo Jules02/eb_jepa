@@ -72,6 +72,32 @@ class _FrameDecoder(nn.Module):
         return out.view(B, T, 2, H, W).permute(0, 2, 1, 3, 4)
 
 
+class _FrameDecoderV2(nn.Module):
+    """Deeper residual decoder (stem + nblocks residual blocks + head).
+
+    Matches abenmanso's decoder architecture saved with keys stem/blocks/head.
+    """
+    def __init__(self, D, hid=128, nblocks=6):
+        super().__init__()
+        self.stem = nn.Conv2d(D, hid, 3, padding=1)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hid, hid, 3, padding=1), nn.GroupNorm(8, hid), nn.GELU(),
+                nn.Conv2d(hid, hid, 3, padding=1), nn.GroupNorm(8, hid),
+            ) for _ in range(nblocks)
+        ])
+        self.act = nn.GELU()
+        self.head = nn.Conv2d(hid, 2, 1)
+
+    def forward(self, z):
+        B, D, T, H, W = z.shape
+        h = self.stem(z.permute(0, 2, 1, 3, 4).reshape(B * T, D, H, W))
+        for blk in self.blocks:
+            h = self.act(h + blk(h))
+        out = self.head(h)
+        return out.view(B, T, 2, H, W).permute(0, 2, 1, 3, 4)
+
+
 def _train_decoder(decoder, jepa, encoder, device, epochs=5):
     """Train decoder (frozen JEPA) to minimise MSE(decode(encode(x)), x)."""
     dcfg = GrayScottConfig(split="train", epoch_size=2000, batch_size=8, num_workers=4)
@@ -100,13 +126,20 @@ def build_decoder(dstc, device, ckpt_path=None):
     If ``ckpt_path`` points to a file that contains a ``'decoder'`` key the
     weights are loaded directly (no training). Otherwise the decoder is trained
     from scratch against the frozen JEPA loaded from ``ckpt_path``."""
-    decoder = _FrameDecoder(D=dstc).to(device)
     if ckpt_path is not None:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         if "decoder" in ckpt:
+            # Auto-detect architecture from state dict keys
+            if any(k.startswith("stem") for k in ckpt["decoder"]):
+                decoder = _FrameDecoderV2(D=dstc).to(device)
+            else:
+                decoder = _FrameDecoder(D=dstc).to(device)
             decoder.load_state_dict(ckpt["decoder"])
             print(f"[decoder] loaded weights from {ckpt_path}", flush=True)
             return decoder
+    decoder = _FrameDecoder(D=dstc).to(device)
+    if ckpt_path is not None:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         # No saved decoder weights — train from the checkpoint's frozen JEPA
         jepa, encoder = load_jepa(ckpt, device)
         _train_decoder(decoder, jepa, encoder, device)
@@ -125,14 +158,14 @@ _HEADLINE_KEYS = ("jepa", "persistence", "floor")
 
 @torch.no_grad()
 def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
-    """Per-horizon VRMSE using The Well's mean-of-ratios protocol.
+    """Per-horizon VRMSE using the paper's exact formula (mean-of-ratios).
 
-    For each sample: vrmse_i = sqrt(sq_err_i / (spatial_var_i + ε)) per channel.
-    Final score = mean over samples (mean-of-ratios), then averaged over channels.
+    Per sample and channel: sqrt(mean_space((pred-true)²) / (var_space(true) + 1e-7)).
+    Final score = mean over samples, then averaged over channels.
     Also returns per-channel '_u' and '_v' diagnostic keys."""
     NC = 2
-    num = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
-    den = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
+    psum = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
+    pcnt = np.zeros(H)
 
     for batch in loader:
         x = batch["video"].to(device)                            # [B,2,C+H,H,W]
@@ -143,14 +176,12 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
 
         for h in range(H):
             true = x[:, :, C + h]                               # [B,2,H,W]
-            mu = true.mean(dim=(-2, -1), keepdim=True)
-            spatial_var = ((true - mu) ** 2).sum(dim=(-2, -1))  # [B,2]
+            true_var = true.var(dim=(-2, -1))                    # [B,2]
 
             def _accum(name, pred_hw):
-                sq_err = ((pred_hw - true) ** 2).sum(dim=(-2, -1))  # [B,2]
-                # sum over batch, keep channels separate (pooled per channel)
-                num[name][h] += sq_err.sum(dim=0).cpu().numpy()       # [2]
-                den[name][h] += spatial_var.sum(dim=0).cpu().numpy()  # [2]
+                mse = ((pred_hw - true) ** 2).mean(dim=(-2, -1))     # [B,2]
+                pv = torch.sqrt(mse / (true_var + 1e-7))              # [B,2]
+                psum[name][h] += pv.sum(dim=0).cpu().numpy()
 
             _accum("jepa", pred_fields[:, :, h])
             _accum("persistence", last_ctx)
@@ -158,9 +189,9 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
             z_true = encoder(true.unsqueeze(2))                  # [B,D,1,H,W]
             floor_field = decoder(z_true).squeeze(2)             # [B,2,H,W]
             _accum("floor", floor_field)
+            pcnt[h] += true.shape[0]
 
-    # pooled ratio per channel → average across channels
-    per_ch = {k: np.sqrt(num[k] / np.maximum(den[k], 1e-8)) for k in _HEADLINE_KEYS}
+    per_ch = {k: psum[k] / np.maximum(pcnt[:, None], 1) for k in _HEADLINE_KEYS}
     result = {k: per_ch[k].mean(axis=-1) for k in _HEADLINE_KEYS}
     for k in _HEADLINE_KEYS:
         result[f"{k}_u"] = per_ch[k][:, 0]
