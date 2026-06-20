@@ -1,5 +1,9 @@
 # EB-JEPA specific stuff
 /datasets/
+
+# Slurm job logs (keep tracked *.sh scripts)
+slurm_*.out
+slurm_*.err
 __pycache__/**
 jepa_decoder.pth
 .vscode/**
