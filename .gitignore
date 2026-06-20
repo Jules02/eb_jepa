@@ -4,6 +4,11 @@
 # Slurm job logs (keep tracked *.sh scripts)
 slurm_*.out
 slurm_*.err
+
+# Generated visualization artifacts (regenerable from the scripts; keep CSVs)
+examples/gray_scott/viz/*.gif
+examples/gray_scott/viz/*.png
+/recon_*.png
 __pycache__/**
 jepa_decoder.pth
 .vscode/**
