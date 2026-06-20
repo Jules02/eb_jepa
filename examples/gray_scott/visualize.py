@@ -265,6 +265,8 @@ def main():
     ap.add_argument("--n", type=int, default=4, help="number of clips to visualize")
     ap.add_argument("--channel", choices=["A", "B", "both", "composite"], default="composite")
     ap.add_argument("--time-stride", type=int, default=4)
+    ap.add_argument("--regime", default=None,
+                    help="restrict clips to one regime (bubbles/gliders/maze/spirals/spots/worms)")
     ap.add_argument("--outdir", default="examples/gray_scott/viz")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--fps", type=int, default=10, help="GIF frames per second")
@@ -328,7 +330,8 @@ def main():
 
     # ── JEPA-only mode (original behaviour) ──────────────────────────────────
     dcfg = GrayScottConfig(split="valid", n_frames=C + args.H, time_stride=args.time_stride,
-                           epoch_size=args.n, batch_size=args.n, num_workers=2)
+                           epoch_size=args.n, batch_size=args.n, num_workers=2,
+                           regime=args.regime)
     loader = make_loader(dcfg, shuffle=False)
     x = next(iter(loader))["video"].to(device)            # [n,2,C+H,H,W]
     truth, pred = predict_clip(jepa, encoder, decoder, x, args.H, device)
@@ -340,15 +343,17 @@ def main():
     else:
         views = [(f"ch{args.channel}", args.channel, "single", CH[args.channel])]
 
+    rtag = f"{args.regime}_" if args.regime else ""
+    rlabel = f" [{args.regime}]" if args.regime else ""
     for i in range(truth.shape[0]):
         for tag, label, mode, ch in views:
             panels = _panels(truth[i], pred[i], mode, ch)
-            title = f"Gray-Scott {label} — sample {i} (epoch {ckpt.get('epoch')}, H={args.H})"
-            png = os.path.join(args.outdir, f"sample{i}_{tag}_filmstrip.png")
+            title = f"Gray-Scott {label}{rlabel} — sample {i} (epoch {ckpt.get('epoch')}, H={args.H})"
+            png = os.path.join(args.outdir, f"{rtag}sample{i}_{tag}_filmstrip.png")
             filmstrip(panels, png, title)
             print(f"  wrote {png}", flush=True)
             if not args.no_gif:
-                gif = os.path.join(args.outdir, f"sample{i}_{tag}.gif")
+                gif = os.path.join(args.outdir, f"{rtag}sample{i}_{tag}.gif")
                 make_gif(panels, gif, title, fps=args.fps)
                 print(f"  wrote {gif}", flush=True)
     print(f"[gs-viz] done -> {args.outdir}", flush=True)
