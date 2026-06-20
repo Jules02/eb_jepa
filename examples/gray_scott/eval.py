@@ -72,6 +72,32 @@ class _FrameDecoder(nn.Module):
         return out.view(B, T, 2, H, W).permute(0, 2, 1, 3, 4)
 
 
+class _FrameDecoderV2(nn.Module):
+    """Deeper residual decoder (stem + nblocks residual blocks + head).
+
+    Matches abenmanso's decoder architecture saved with keys stem/blocks/head.
+    """
+    def __init__(self, D, hid=128, nblocks=6):
+        super().__init__()
+        self.stem = nn.Conv2d(D, hid, 3, padding=1)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hid, hid, 3, padding=1), nn.GroupNorm(8, hid), nn.GELU(),
+                nn.Conv2d(hid, hid, 3, padding=1), nn.GroupNorm(8, hid),
+            ) for _ in range(nblocks)
+        ])
+        self.act = nn.GELU()
+        self.head = nn.Conv2d(hid, 2, 1)
+
+    def forward(self, z):
+        B, D, T, H, W = z.shape
+        h = self.stem(z.permute(0, 2, 1, 3, 4).reshape(B * T, D, H, W))
+        for blk in self.blocks:
+            h = self.act(h + blk(h))
+        out = self.head(h)
+        return out.view(B, T, 2, H, W).permute(0, 2, 1, 3, 4)
+
+
 def _train_decoder(decoder, jepa, encoder, device, epochs=5):
     """Train decoder (frozen JEPA) to minimise MSE(decode(encode(x)), x)."""
     dcfg = GrayScottConfig(split="train", epoch_size=2000, batch_size=8, num_workers=4)
@@ -100,13 +126,20 @@ def build_decoder(dstc, device, ckpt_path=None):
     If ``ckpt_path`` points to a file that contains a ``'decoder'`` key the
     weights are loaded directly (no training). Otherwise the decoder is trained
     from scratch against the frozen JEPA loaded from ``ckpt_path``."""
-    decoder = _FrameDecoder(D=dstc).to(device)
     if ckpt_path is not None:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         if "decoder" in ckpt:
+            # Auto-detect architecture from state dict keys
+            if any(k.startswith("stem") for k in ckpt["decoder"]):
+                decoder = _FrameDecoderV2(D=dstc).to(device)
+            else:
+                decoder = _FrameDecoder(D=dstc).to(device)
             decoder.load_state_dict(ckpt["decoder"])
             print(f"[decoder] loaded weights from {ckpt_path}", flush=True)
             return decoder
+    decoder = _FrameDecoder(D=dstc).to(device)
+    if ckpt_path is not None:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         # No saved decoder weights — train from the checkpoint's frozen JEPA
         jepa, encoder = load_jepa(ckpt, device)
         _train_decoder(decoder, jepa, encoder, device)

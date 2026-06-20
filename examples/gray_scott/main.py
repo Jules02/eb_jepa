@@ -36,7 +36,8 @@ from eb_jepa.training_utils import setup_wandb
 def build_encoder(cfg):
     # stride-1 everywhere (default), no avg-pool -> latent stays 128x128
     # TemporalBatchMixin on ResNet5 folds T into batch for 5D inputs
-    return ResNet5(in_d=cfg.dobs, h_d=cfg.henc, out_d=cfg.dstc)
+    norm = cfg.get("norm", "batch") if hasattr(cfg, "get") else getattr(cfg, "norm", "batch")
+    return ResNet5(in_d=cfg.dobs, h_d=cfg.henc, out_d=cfg.dstc, norm=norm)
 
 
 # --------------------------------------------------------------------------- #
@@ -44,8 +45,9 @@ def build_encoder(cfg):
 # --------------------------------------------------------------------------- #
 def build_jepa(encoder, cfg):
     D = cfg.dstc
+    norm = cfg.get("norm", "batch") if hasattr(cfg, "get") else getattr(cfg, "norm", "batch")
     predictor = StateOnlyPredictor(
-        ResUNet(in_d=2 * D, h_d=cfg.hpre, out_d=D),
+        ResUNet(in_d=2 * D, h_d=cfg.hpre, out_d=D, norm=norm),
         context_length=2,
     )
     regularizer = VCLoss(
