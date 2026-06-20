@@ -3,7 +3,8 @@
 The Well's Gray-Scott split is 6 distinct (F, k) regimes, one HDF5 file each. This
 builds a single looping GIF with, on the left, the classic Gray-Scott phase diagram
 (feed rate F vs kill rate k) annotated with the 6 points the model was trained on,
-and on the right a 2x3 grid of those regimes' B (activator) field evolving in time.
+and on the right a 2x3 grid of those regimes evolving in time, rendered in the same
+green/red RGB style as eval_compare.py (R = chemical A, G = chemical B).
 
 No torch / GPU needed — reads the HDF5 directly with h5py.
 
@@ -36,12 +37,25 @@ COLORS = {
 }
 
 
+def _norm01(x, lo, hi):
+    return np.clip((x - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+
+
+def _rgb(A, B):
+    """[T,H,W] A,B -> [T,H,W,3] RGB: R=A, G=B (per-channel min/max), same as
+    eval_compare.py's green/red composite. Blue stays 0."""
+    R = _norm01(A, float(A.min()), float(A.max()))
+    G = _norm01(B, float(B.min()), float(B.max()))
+    return np.stack([R, G, np.zeros_like(R)], axis=-1)
+
+
 def load(split, traj, frames, tmax):
-    """Return {regime: (F, k, stack[T,H,W])} sampling `frames` timesteps of B.
+    """Return {regime: (F, k, rgb[T,H,W,3])} sampling `frames` timesteps.
 
     Frames are drawn from t in [0, tmax]; a smaller tmax means smaller jumps
     between frames, so fast regimes (spirals/gliders/worms) animate smoothly
-    instead of looking like they fast-forward.
+    instead of looking like they fast-forward. Each frame is the green/red
+    R=A, G=B composite used in eval_compare.py.
     """
     out = {}
     for p in sorted(glob.glob(os.path.join(DATA, split, "*.hdf5"))):
@@ -50,17 +64,17 @@ def load(split, traj, frames, tmax):
             continue
         name, F, k = m.group(1), float(m.group(2)), float(m.group(3))
         with h5py.File(p, "r") as f:
-            B = f["t0_fields/B"]
-            nt = B.shape[1]
+            nt = f["t0_fields/B"].shape[1]
             hi = nt - 1 if tmax <= 0 else min(tmax, nt - 1)
             ts = np.linspace(0, hi, frames).astype(int)
-            stack = B[traj, ts]                       # [T, 128, 128]
-        out[name] = (F, k, np.asarray(stack))
-        print(f"  loaded {name:8s} F={F:<6} k={k:<6} -> {stack.shape}", flush=True)
+            A = np.asarray(f["t0_fields/A"][traj, ts])    # [T, 128, 128]
+            B = np.asarray(f["t0_fields/B"][traj, ts])
+        out[name] = (F, k, _rgb(A, B))
+        print(f"  loaded {name:8s} F={F:<6} k={k:<6} -> {A.shape}", flush=True)
     return out
 
 
-def build(data, out_path, fps, cmap, dpi):
+def build(data, out_path, fps, dpi):
     names = [n for n in ORDER if n in data]
     T = next(iter(data.values()))[2].shape[0]
 
@@ -86,14 +100,12 @@ def build(data, out_path, fps, cmap, dpi):
     ph.grid(alpha=0.3)
     ph.margins(0.18)
 
-    # --- right: one animated panel per regime ----------------------------------
+    # --- right: one animated panel per regime (green/red R=A, G=B composite) ----
     ims = {}
     for n in names:
         F, k, stack = data[n]
         a = ax[n]
-        vmin, vmax = float(stack.min()), float(stack.max())
-        ims[n] = a.imshow(stack[0], cmap=cmap, vmin=vmin, vmax=vmax,
-                          interpolation="bilinear", animated=True)
+        ims[n] = a.imshow(stack[0], interpolation="bilinear", animated=True)
         a.set_title(f"{n}\nF={F}  k={k}", fontsize=10, color=COLORS[n],
                     fontweight="bold")
         a.set_xticks([]); a.set_yticks([])
@@ -129,7 +141,6 @@ def main():
                          "smaller = smaller per-frame jumps, smoother fast regimes)")
     ap.add_argument("--fps", type=int, default=7)
     ap.add_argument("--dpi", type=int, default=140, help="GIF render dpi (sharpness)")
-    ap.add_argument("--cmap", default="magma")
     ap.add_argument("--out", default="examples/gray_scott/viz/gray_scott_regimes.gif")
     args = ap.parse_args()
 
@@ -137,7 +148,7 @@ def main():
     print(f"[gs-regimes-gif] loading {args.split} traj {args.traj}, "
           f"{args.frames} frames/regime", flush=True)
     data = load(args.split, args.traj, args.frames, args.tmax)
-    build(data, args.out, args.fps, args.cmap, args.dpi)
+    build(data, args.out, args.fps, args.dpi)
 
 
 if __name__ == "__main__":
