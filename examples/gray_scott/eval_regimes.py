@@ -58,7 +58,8 @@ def benchmark(jepa, encoder, decoder, device, regimes, args, data_root):
             epoch_size=args.n_per_regime, batch_size=args.batch_size,
             num_workers=args.num_workers)
         loader = make_loader(dcfg, shuffle=False)
-        scores = vrmse_per_horizon(jepa, encoder, decoder, loader, device, args.H)
+        scores = vrmse_per_horizon(jepa, encoder, decoder, loader, device, args.H,
+                                   metric=args.metric)
         results[name] = {"F": F, "k": k, **_summary(scores, args.H)}
         curves[name] = {kk: scores[kk] for kk in ("jepa", "persistence", "floor")}
         s = results[name]
@@ -147,6 +148,9 @@ def main():
     ap.add_argument("--time-stride", type=int, default=4)
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--split", default="valid", choices=["train", "valid", "test"])
+    ap.add_argument("--metric", default="vrmse", choices=["vrmse", "pooled"],
+                    help="'vrmse'=The Well mean-of-ratios (blows up on near-uniform "
+                         "low-F frames); 'pooled'=denominator-stable diagnostic")
     ap.add_argument("--outdir", default="examples/gray_scott/viz")
     ap.add_argument("--no-plot", action="store_true")
     args = ap.parse_args()
@@ -163,18 +167,21 @@ def main():
 
     regimes = list_regimes(args.split, data_root)
     print(f"[gs-regimes] ckpt epoch {ckpt.get('epoch')}, H={args.H}, "
-          f"{args.n_per_regime}/regime, split={args.split}, device={device}", flush=True)
+          f"{args.n_per_regime}/regime, split={args.split}, metric={args.metric}, "
+          f"device={device}", flush=True)
     print(f"[gs-regimes] regimes: {list(regimes)}", flush=True)
 
     results, curves = benchmark(jepa, encoder, decoder, device, regimes, args, data_root)
     order = print_table(results)
 
-    csv_path = os.path.join(args.outdir, "regime_vrmse.csv")
+    # suffix outputs by metric so a 'pooled' run doesn't clobber the 'vrmse' one
+    sfx = "" if args.metric == "vrmse" else f"_{args.metric}"
+    csv_path = os.path.join(args.outdir, f"regime_vrmse{sfx}.csv")
     write_csv(results, csv_path)
     print(f"\n[gs-regimes] wrote {csv_path}", flush=True)
     if not args.no_plot:
-        bar = os.path.join(args.outdir, "regime_vrmse_bars.png")
-        crv = os.path.join(args.outdir, "regime_vrmse_curves.png")
+        bar = os.path.join(args.outdir, f"regime_vrmse{sfx}_bars.png")
+        crv = os.path.join(args.outdir, f"regime_vrmse{sfx}_curves.png")
         plot_bars(results, order, bar)
         plot_curves(curves, crv)
         print(f"[gs-regimes] wrote {bar}\n[gs-regimes] wrote {crv}", flush=True)

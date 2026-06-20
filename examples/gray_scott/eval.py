@@ -157,15 +157,25 @@ _HEADLINE_KEYS = ("jepa", "persistence", "floor")
 
 
 @torch.no_grad()
-def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
-    """Per-horizon VRMSE using the paper's exact formula (mean-of-ratios).
+def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H, metric="vrmse"):
+    """Per-horizon VRMSE, either The Well paper metric or the pooled diagnostic.
 
-    Per sample and channel: sqrt(mean_space((pred-true)²) / (var_space(true) + 1e-7)).
-    Final score = mean over samples, then averaged over channels.
-    Also returns per-channel '_u' and '_v' diagnostic keys."""
+    metric='vrmse' (default, The Well App. E.3): per sample/channel
+        sqrt(mean_space((pred-true)²) / (var_space(true) + 1e-7)), then mean over
+        samples. Mean-of-ratios -> matches the paper, but a single near-uniform
+        Gray-Scott frame (var≈0) blows the average up to 10²-10³ on low-F regimes.
+    metric='pooled': aggregate sum_samples(MSE) and sum_samples(var) per
+        horizon/channel, THEN ratio -> sqrt(ΣMSE/Σvar). Not the paper metric, but
+        denominator-stable (no per-frame blow-up). Good for ranking regimes.
+
+    Both average the two channels and also return per-channel '_u'/'_v' keys."""
+    if metric not in ("vrmse", "pooled"):
+        raise ValueError(f"metric must be 'vrmse' or 'pooled', got {metric!r}")
     NC = 2
-    psum = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
+    psum = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}      # vrmse: Σ per-sample ratio
     pcnt = np.zeros(H)
+    num = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}       # pooled: Σ mse
+    den = np.zeros((H, NC))                                     # pooled: Σ var (shared)
 
     for batch in loader:
         x = batch["video"].to(device)                            # [B,2,C+H,H,W]
@@ -180,8 +190,11 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
 
             def _accum(name, pred_hw):
                 mse = ((pred_hw - true) ** 2).mean(dim=(-2, -1))     # [B,2]
-                pv = torch.sqrt(mse / (true_var + 1e-7))              # [B,2]
-                psum[name][h] += pv.sum(dim=0).cpu().numpy()
+                if metric == "vrmse":
+                    pv = torch.sqrt(mse / (true_var + 1e-7))          # [B,2]
+                    psum[name][h] += pv.sum(dim=0).cpu().numpy()
+                else:
+                    num[name][h] += mse.sum(dim=0).double().cpu().numpy()
 
             _accum("jepa", pred_fields[:, :, h])
             _accum("persistence", last_ctx)
@@ -189,9 +202,13 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
             z_true = encoder(true.unsqueeze(2))                  # [B,D,1,H,W]
             floor_field = decoder(z_true).squeeze(2)             # [B,2,H,W]
             _accum("floor", floor_field)
+            den[h] += true_var.sum(dim=0).double().cpu().numpy()
             pcnt[h] += true.shape[0]
 
-    per_ch = {k: psum[k] / np.maximum(pcnt[:, None], 1) for k in _HEADLINE_KEYS}
+    if metric == "vrmse":
+        per_ch = {k: psum[k] / np.maximum(pcnt[:, None], 1) for k in _HEADLINE_KEYS}
+    else:
+        per_ch = {k: np.sqrt(num[k] / np.maximum(den, 1e-12)) for k in _HEADLINE_KEYS}
     result = {k: per_ch[k].mean(axis=-1) for k in _HEADLINE_KEYS}
     for k in _HEADLINE_KEYS:
         result[f"{k}_u"] = per_ch[k][:, 0]
