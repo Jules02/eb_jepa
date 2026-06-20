@@ -1,0 +1,40 @@
+# Gray-Scott temporal-JEPA — medium model, full GPU on GB200.
+# dstc=64 gives floor << 0.1365 (FNO target); hpre=64 keeps ResUNet memory manageable.
+# n_frames=16 matches the README spec.
+meta:
+  seed: 0
+  ckpt_dir: /lustre/work/vivatech-jepadormi/aduplessi/checkpoints/gray_scott/large
+data:
+  data_root: /lustre/work/pdl17890/udl806719/datasets/the_well/gray_scott_reaction_diffusion
+  split: train
+  channels: 2
+  img_size: 128
+  n_frames: 10
+  time_stride: 4
+  epoch_size: 28800         # full dataset (120 traj × ~240 clips)
+  batch_size: 8
+  num_workers: 8
+model:
+  dobs: 2
+  henc: 128                 # was 32; gives richer latent
+  dstc: 64                  # was 16; floor should be << 0.54
+  hpre: 64                  # lighter predictor (in_d=2*64=128)
+  steps: 6                  # predict 6 frames from 2 context
+  std_coeff: 10.0
+  cov_coeff: 100.0
+loss:
+  std_coeff: 10.0
+  cov_coeff: 100.0
+optim:
+  epochs: 50
+  lr: 3.0e-4
+training:
+  use_amp: true
+  dtype: bfloat16
+logging:
+  log_every: 50
+  save_every: 5
+  eval_every: 1             # run VRMSE eval inline every epoch (warm-started decoder)
+  log_wandb: true
+  wandb_project: eb_jepa
+  wandb_run_name: gray_scott_large

@@ -58,6 +58,65 @@ def build_jepa(encoder, cfg):
 
 
 # --------------------------------------------------------------------------- #
+# INLINE EVAL HELPER
+# --------------------------------------------------------------------------- #
+def _run_inline_eval(jepa, encoder, cfg, device, wandb_run, epoch, gstep,
+                     decoder, decoder_opt, eval_loader, H=30):
+    """Run VRMSE eval with a persistent warm-started decoder (fast, every epoch).
+
+    Reports per-horizon VRMSE and The Well Table 3 windows [6:12] and [13:30]."""
+    from examples.gray_scott.eval import vrmse_per_horizon, window_vrmse, WELL_WINDOWS
+    jepa.eval()
+    # Fine-tune decoder for 1 pass (warm start — fast since encoder barely changed)
+    decoder.train()
+    for batch in eval_loader:
+        x = batch["video"].to(device)
+        with torch.no_grad():
+            z = encoder(x)
+        recon = decoder(z)
+        loss = torch.nn.functional.mse_loss(recon, x)
+        decoder_opt.zero_grad(set_to_none=True)
+        loss.backward()
+        decoder_opt.step()
+    decoder.eval()
+    scores = vrmse_per_horizon(jepa, encoder, decoder, eval_loader, device, H)
+    from examples.gray_scott.eval import _HEADLINE_KEYS
+    for name in _HEADLINE_KEYS:
+        arr = scores[name]
+        print(f"[eval-e{epoch}] {name:14s} h1={arr[0]:.3f} h{H}={arr[-1]:.3f}", flush=True)
+    for name in ("jepa", "floor"):
+        for ch in ("u", "v"):
+            arr = scores[f"{name}_{ch}"]
+            print(f"[eval-e{epoch}] {name}_{ch:11s} h1={arr[0]:.3f} h{H}={arr[-1]:.3f}", flush=True)
+    # The Well Table 3 windowed summary
+    for wname, (start, end) in WELL_WINDOWS.items():
+        if end <= H:
+            w = window_vrmse(scores, wname)
+            headline = "  ".join(f"{k}={w[k]:.3f}" for k in _HEADLINE_KEYS)
+            print(f"[eval-e{epoch}] window {wname}: {headline}", flush=True)
+            print(f"[eval-e{epoch}]   jepa_u={w['jepa_u']:.3f}  jepa_v={w['jepa_v']:.3f}", flush=True)
+    if wandb_run:
+        import wandb
+        log_dict = {}
+        for h in range(H):
+            for name in _HEADLINE_KEYS:
+                log_dict[f"eval/vrmse_{name}_h{h+1}"] = scores[name][h]
+            for name in ("jepa", "floor"):
+                for ch in ("u", "v"):
+                    log_dict[f"eval/vrmse_{name}_{ch}_h{h+1}"] = scores[f"{name}_{ch}"][h]
+        for wname, (start, end) in WELL_WINDOWS.items():
+            if end <= H:
+                w = window_vrmse(scores, wname)
+                for name in _HEADLINE_KEYS:
+                    log_dict[f"eval/vrmse_{name}_w{wname.replace(':','_')}"] = w[name]
+                for name in ("jepa", "floor"):
+                    for ch in ("u", "v"):
+                        log_dict[f"eval/vrmse_{name}_{ch}_w{wname.replace(':','_')}"] = w[f"{name}_{ch}"]
+        wandb.log(log_dict, step=gstep)
+    jepa.train()
+
+
+# --------------------------------------------------------------------------- #
 # TRAINING LOOP  — provided
 # --------------------------------------------------------------------------- #
 def run(fname="examples/gray_scott/cfgs/train.yaml", cfg=None, folder=None, **overrides):
@@ -103,6 +162,21 @@ def run(fname="examples/gray_scott/cfgs/train.yaml", cfg=None, folder=None, **ov
                     "jepa": jepa.state_dict(),
                     "cfg": OmegaConf.to_container(cfg, resolve=True)},
                    os.path.join(ckpt_dir, name))
+
+    # persistent decoder for per-epoch VRMSE eval (warm-started each epoch)
+    eval_every = cfg.logging.get("eval_every", 0)
+    if eval_every > 0:
+        from examples.gray_scott.eval import _FrameDecoder  # noqa: F401
+        H_eval = 30    # The Well Table 3: 30-step rollout, windows [6:12] and [13:30]
+        C_eval = 2
+        _decoder = _FrameDecoder(D=cfg.model.dstc).to(device)
+        _decoder_opt = torch.optim.Adam(_decoder.parameters(), lr=1e-3)
+        _eval_loader = make_loader(GrayScottConfig(
+            **{**dcfg.__dict__, "split": "valid",
+               "n_frames": C_eval + H_eval, "epoch_size": 400}), shuffle=False)
+        print(f"[gs] inline eval enabled every {eval_every} epoch(s), H={H_eval}", flush=True)
+    else:
+        _decoder = _decoder_opt = _eval_loader = None
 
     gstep = 0
     for epoch in range(cfg.optim.epochs):
@@ -151,6 +225,11 @@ def run(fname="examples/gray_scott/cfgs/train.yaml", cfg=None, folder=None, **ov
         save_every = cfg.logging.get("save_every", 5)
         if (epoch + 1) % save_every == 0:
             _save(f"epoch_{epoch}.pth.tar")
+
+        # optional inline VRMSE eval (logged to W&B if enabled)
+        if eval_every > 0 and (epoch + 1) % eval_every == 0:
+            _run_inline_eval(jepa, encoder, cfg, device, wandb_run, epoch, gstep,
+                             _decoder, _decoder_opt, _eval_loader, H=H_eval)
 
     if wandb_run:
         import wandb

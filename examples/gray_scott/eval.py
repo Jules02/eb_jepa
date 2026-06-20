@@ -22,6 +22,8 @@ from eb_jepa.datasets.gray_scott.dataset import GrayScottConfig, make_loader
 from examples.gray_scott.main import build_encoder, build_jepa
 
 C = 2            # context_length (StateOnlyPredictor predicts from the previous 2 frames)
+# The Well Table 3 evaluation windows (steps after context, 1-indexed)
+WELL_WINDOWS = {"6:12": (5, 12), "13:30": (12, 30)}  # (start_idx, end_idx) inclusive, 0-indexed into H
 
 
 def load_jepa(ckpt, device):
@@ -118,48 +120,65 @@ def build_decoder(dstc, device, ckpt_path=None):
 # --------------------------------------------------------------------------- #
 # METRIC  — # TODO
 # --------------------------------------------------------------------------- #
+_HEADLINE_KEYS = ("jepa", "persistence", "floor")
+
+
 @torch.no_grad()
 def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H):
-    """Per-horizon field-space VRMSE for JEPA, persistence, and decoder floor.
+    """Per-horizon VRMSE using The Well's mean-of-ratios protocol.
 
-    VRMSE = sqrt(sum_space (pred-true)^2 / sum_space (true - mean_true)^2).
-    Numerators and denominators are aggregated across the full dataset before
-    taking the ratio (avoids blow-up on near-uniform frames)."""
-    num = {k: np.zeros(H) for k in ("jepa", "persistence", "floor")}
-    den = {k: np.zeros(H) for k in ("jepa", "persistence", "floor")}
+    For each sample: vrmse_i = sqrt(sq_err_i / (spatial_var_i + ε)) per channel.
+    Final score = mean over samples (mean-of-ratios), then averaged over channels.
+    Also returns per-channel '_u' and '_v' diagnostic keys."""
+    NC = 2
+    num = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
+    den = {k: np.zeros((H, NC)) for k in _HEADLINE_KEYS}
 
     for batch in loader:
-        x = batch["video"].to(device)                          # [B,2,C+H,H,W]
-        last_ctx = x[:, :, C - 1]                             # [B,2,H,W]
+        x = batch["video"].to(device)                            # [B,2,C+H,H,W]
+        last_ctx = x[:, :, C - 1]                               # [B,2,H,W]
 
-        # JEPA: roll predictor in latent space then decode
-        pred_z = rollout_latents(jepa, x, H, device)          # [B,D,C+H,h,w]
-        pred_fields = decoder(pred_z[:, :, C:])               # [B,2,H,H,W]
+        pred_z = rollout_latents(jepa, x, H, device)            # [B,D,C+H,h,w]
+        pred_fields = decoder(pred_z[:, :, C:])                  # [B,2,H,H,W]
 
         for h in range(H):
-            true = x[:, :, C + h]                             # [B,2,H,W]
+            true = x[:, :, C + h]                               # [B,2,H,W]
             mu = true.mean(dim=(-2, -1), keepdim=True)
             spatial_var = ((true - mu) ** 2).sum(dim=(-2, -1))  # [B,2]
 
             def _accum(name, pred_hw):
                 sq_err = ((pred_hw - true) ** 2).sum(dim=(-2, -1))  # [B,2]
-                num[name][h] += sq_err.sum().item()
-                den[name][h] += spatial_var.sum().item()
+                # sum over batch, keep channels separate (pooled per channel)
+                num[name][h] += sq_err.sum(dim=0).cpu().numpy()       # [2]
+                den[name][h] += spatial_var.sum(dim=0).cpu().numpy()  # [2]
 
             _accum("jepa", pred_fields[:, :, h])
             _accum("persistence", last_ctx)
 
-            # Decoder floor: decode(encode(ground-truth frame))
-            z_true = encoder(true.unsqueeze(2))                # [B,D,1,H,W]
-            floor_field = decoder(z_true).squeeze(2)           # [B,2,H,W]
+            z_true = encoder(true.unsqueeze(2))                  # [B,D,1,H,W]
+            floor_field = decoder(z_true).squeeze(2)             # [B,2,H,W]
             _accum("floor", floor_field)
 
-    return {k: np.sqrt(num[k] / np.maximum(den[k], 1e-8)) for k in num}
+    # pooled ratio per channel → average across channels
+    per_ch = {k: np.sqrt(num[k] / np.maximum(den[k], 1e-8)) for k in _HEADLINE_KEYS}
+    result = {k: per_ch[k].mean(axis=-1) for k in _HEADLINE_KEYS}
+    for k in _HEADLINE_KEYS:
+        result[f"{k}_u"] = per_ch[k][:, 0]
+        result[f"{k}_v"] = per_ch[k][:, 1]
+    return result
+
+
+def window_vrmse(scores, window_name):
+    """Average VRMSE over a named window. Returns all keys (headline + _u/_v)."""
+    start, end = WELL_WINDOWS[window_name]
+    H = scores[_HEADLINE_KEYS[0]].shape[0]
+    end = min(end, H)
+    return {k: float(scores[k][start:end].mean()) for k in scores}
 
 
 def main():
     ckpt_path = sys.argv[sys.argv.index("--ckpt") + 1]
-    H = int(sys.argv[sys.argv.index("--H") + 1]) if "--H" in sys.argv else 10
+    H = int(sys.argv[sys.argv.index("--H") + 1]) if "--H" in sys.argv else 30
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -172,8 +191,28 @@ def main():
                            epoch_size=400, batch_size=8, num_workers=8)
     loader = make_loader(dcfg, shuffle=False)
     scores = vrmse_per_horizon(jepa, encoder, decoder, loader, device, H)
-    for name, arr in scores.items():
+
+    # Per-horizon headlines
+    for name in _HEADLINE_KEYS:
+        arr = scores[name]
         print(f"   {name:14s} h1={arr[0]:.3f} h{H}={arr[-1]:.3f} | {np.round(arr, 3).tolist()}", flush=True)
+    # Per-channel diagnostics (jepa and floor only)
+    print("   --- per channel ---", flush=True)
+    for name in ("jepa", "floor"):
+        for ch in ("u", "v"):
+            arr = scores[f"{name}_{ch}"]
+            print(f"   {name}_{ch:11s} h1={arr[0]:.3f} h{H}={arr[-1]:.3f}", flush=True)
+
+    # The Well Table 3 windows
+    print("\n   === The Well Table 3 comparison ===", flush=True)
+    for wname in WELL_WINDOWS:
+        start, end = WELL_WINDOWS[wname]
+        if end <= H:
+            w = window_vrmse(scores, wname)
+            headline = "  ".join(f"{k}={w[k]:.3f}" for k in _HEADLINE_KEYS)
+            print(f"   window {wname}: {headline}", flush=True)
+            print(f"      jepa_u={w['jepa_u']:.3f}  jepa_v={w['jepa_v']:.3f}  "
+                  f"floor_u={w['floor_u']:.3f}  floor_v={w['floor_v']:.3f}", flush=True)
 
 
 if __name__ == "__main__":
