@@ -117,7 +117,7 @@ def filmstrip(panels, sample_path, title):
     plt.close(fig)
 
 
-def make_gif(panels, gif_path, title, fps=3):
+def make_gif(panels, gif_path, title, fps=8):
     """Animated GIF: truth | prediction | error panels across time."""
     T = panels[0][1].shape[0]
     fig, axes = plt.subplots(1, 3, figsize=(9, 3.4))
@@ -153,6 +153,7 @@ def main():
     ap.add_argument("--time-stride", type=int, default=4)
     ap.add_argument("--outdir", default="examples/gray_scott/viz")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--fps", type=int, default=8, help="GIF frames per second")
     ap.add_argument("--no-gif", action="store_true", help="skip the animated GIFs")
     args = ap.parse_args()
 
@@ -190,7 +191,7 @@ def main():
             print(f"  wrote {png}", flush=True)
             if not args.no_gif:
                 gif = os.path.join(args.outdir, f"sample{i}_{tag}.gif")
-                make_gif(panels, gif, title)
+                make_gif(panels, gif, title, fps=args.fps)
                 print(f"  wrote {gif}", flush=True)
     print(f"[gs-viz] done -> {args.outdir}", flush=True)
 
