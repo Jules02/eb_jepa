@@ -36,9 +36,15 @@ class conv3d2(nn.Sequential):
 
 
 def _make_norm(norm, c):
-    """Norm-layer factory. norm='batch' -> BatchNorm2d (default); norm='group' -> GroupNorm."""
+    """Norm-layer factory. ``norm="batch"`` -> BatchNorm2d (default, backward-compatible);
+    ``norm="group"`` -> GroupNorm. GroupNorm avoids the batch-coupling + EMA running-stat
+    mismatch that BatchNorm causes in a JEPA with an EMA target encoder and small batches.
+    Group count = largest power-of-two divisor of ``c`` that is <= 8."""
     if norm == "group":
-        return nn.GroupNorm(min(32, c), c)
+        g = 8
+        while c % g:
+            g //= 2
+        return nn.GroupNorm(g, c)
     return nn.BatchNorm2d(c)
 
 

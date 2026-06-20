@@ -33,11 +33,27 @@ from eb_jepa.training_utils import setup_wandb
 # --------------------------------------------------------------------------- #
 # 1) ENCODER  — # TODO
 # --------------------------------------------------------------------------- #
+def _augment_d4(x):
+    """Apply one random dihedral-group (D4) spatial symmetry to a clip batch [B,2,T,H,W].
+
+    Gray-Scott is isotropic, so 90-degree rotations and flips are EXACT symmetries of the
+    dynamics -> a free 8x data multiplier that fights the low regime-diversity (6 train
+    files). One transform per batch (covers all 8 over many steps), applied identically to
+    every frame and both channels so spatial structure stays consistent."""
+    k = int(torch.randint(0, 4, (1,)).item())
+    if k:
+        x = torch.rot90(x, k, dims=(-2, -1))
+    if torch.rand(1).item() < 0.5:
+        x = torch.flip(x, dims=(-1,))
+    return x
+
+
 def build_encoder(cfg):
     # stride-1 everywhere (default), no avg-pool -> latent stays 128x128
     # TemporalBatchMixin on ResNet5 folds T into batch for 5D inputs
-    norm = cfg.get("norm", "batch") if hasattr(cfg, "get") else getattr(cfg, "norm", "batch")
-    return ResNet5(in_d=cfg.dobs, h_d=cfg.henc, out_d=cfg.dstc, norm=norm)
+    # norm="group" (cfg.norm) avoids BatchNorm's EMA-target / small-batch pathologies
+    return ResNet5(in_d=cfg.dobs, h_d=cfg.henc, out_d=cfg.dstc,
+                   norm=cfg.get("norm", "batch"))
 
 
 # --------------------------------------------------------------------------- #
@@ -45,9 +61,8 @@ def build_encoder(cfg):
 # --------------------------------------------------------------------------- #
 def build_jepa(encoder, cfg):
     D = cfg.dstc
-    norm = cfg.get("norm", "batch") if hasattr(cfg, "get") else getattr(cfg, "norm", "batch")
     predictor = StateOnlyPredictor(
-        ResUNet(in_d=2 * D, h_d=cfg.hpre, out_d=D, norm=norm),
+        ResUNet(in_d=2 * D, h_d=cfg.hpre, out_d=D, norm=cfg.get("norm", "batch")),
         context_length=2,
     )
     regularizer = VCLoss(
@@ -129,10 +144,16 @@ def run(fname="examples/gray_scott/cfgs/train.yaml", cfg=None, folder=None, **ov
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(cfg.meta.seed)
 
-    dcfg = GrayScottConfig(**OmegaConf.to_container(cfg.data, resolve=True))
+    data_kwargs = OmegaConf.to_container(cfg.data, resolve=True)
+    # val_epoch_size is a training-loop knob, not a GrayScottConfig field -> pop it out
+    val_epoch_size = data_kwargs.pop("val_epoch_size", None)
+    dcfg = GrayScottConfig(**data_kwargs)
     train_loader = make_loader(dcfg)
+    # larger validation set -> lower-variance val estimate (default was only batch*10=80 clips)
+    if val_epoch_size is None:
+        val_epoch_size = dcfg.batch_size * 10
     val_loader = make_loader(GrayScottConfig(**{**dcfg.__dict__, "split": "valid",
-                                                "epoch_size": dcfg.batch_size * 10}), shuffle=False)
+                                                "epoch_size": val_epoch_size}), shuffle=False)
     print(f"[gs] {len(train_loader.dataset.files)} train hdf5 | "
           f"clip=[{dcfg.channels},{dcfg.n_frames},{dcfg.img_size},{dcfg.img_size}] "
           f"stride={dcfg.time_stride} | {len(train_loader)} steps/epoch", flush=True)
@@ -141,7 +162,8 @@ def run(fname="examples/gray_scott/cfgs/train.yaml", cfg=None, folder=None, **ov
     jepa = build_jepa(encoder, cfg.model).to(device)
     print(f"[gs] params: {sum(p.numel() for p in jepa.parameters()) / 1e6:.2f}M", flush=True)
 
-    opt = torch.optim.Adam(jepa.parameters(), lr=cfg.optim.lr)
+    opt = torch.optim.AdamW(jepa.parameters(), lr=cfg.optim.lr,
+                            weight_decay=cfg.optim.get("weight_decay", 0.0))
     use_amp = bool(cfg.training.use_amp) and device.type == "cuda"
     amp_dtype = torch.bfloat16 if cfg.training.get("dtype", "bfloat16") == "bfloat16" else torch.float16
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp and amp_dtype == torch.float16)
@@ -186,6 +208,8 @@ def run(fname="examples/gray_scott/cfgs/train.yaml", cfg=None, folder=None, **ov
         t0 = time.time()
         for batch in train_loader:
             x = batch["video"].to(device, non_blocking=True)        # [B,2,T,H,W]
+            if cfg.training.get("augment", False):
+                x = _augment_d4(x)   # free data via exact D4 symmetries of isotropic GS
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type, enabled=use_amp, dtype=amp_dtype):
                 _, (jepa_loss, regl, _, _, pl) = jepa.unroll(
@@ -205,22 +229,25 @@ def run(fname="examples/gray_scott/cfgs/train.yaml", cfg=None, folder=None, **ov
                                "train/vc_loss": regl.item(),
                                "train/pred_loss": pl.item()}, step=gstep)
 
-        # val
-        jepa.eval(); vl = 0.0; nb = 0
+        # val — track the PREDICTION loss separately from the VC anti-collapse term, since
+        # the total is VC-dominated and a rising total can be pure VC noise, not overfit.
+        jepa.eval(); vl = vp = vc = 0.0; nb = 0
         with torch.no_grad():
             for batch in val_loader:
                 x = batch["video"].to(device)
                 with torch.amp.autocast(device.type, enabled=use_amp, dtype=amp_dtype):
-                    _, (jl, _, _, _, _) = jepa.unroll(x, actions=None, nsteps=cfg.model.steps,
-                                                      unroll_mode="parallel", compute_loss=True)
-                vl += jl.item(); nb += 1
-        val_loss = vl / max(nb, 1)
+                    _, (jl, rg, _, _, plv) = jepa.unroll(x, actions=None, nsteps=cfg.model.steps,
+                                                         unroll_mode="parallel", compute_loss=True)
+                vl += jl.item(); vp += plv.item(); vc += rg.item(); nb += 1
+        nb = max(nb, 1)
+        val_loss, val_pred, val_vc = vl / nb, vp / nb, vc / nb
         elapsed = time.time() - t0
-        print(f"[epoch {epoch}] {elapsed:.0f}s | val_loss={val_loss:.4f}", flush=True)
+        print(f"[epoch {epoch}] {elapsed:.0f}s | val_loss={val_loss:.4f} "
+              f"val_pred={val_pred:.5f} val_vc={val_vc:.4f}", flush=True)
         if wandb_run:
             import wandb
-            wandb.log({"val/loss": val_loss, "epoch": epoch,
-                       "train/loss_last": jepa_loss.item()}, step=gstep)
+            wandb.log({"val/loss": val_loss, "val/pred_loss": val_pred, "val/vc_loss": val_vc,
+                       "epoch": epoch, "train/loss_last": jepa_loss.item()}, step=gstep)
 
         # always save latest; save numbered checkpoint every save_every epochs
         _save("latest.pth.tar")

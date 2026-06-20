@@ -1,0 +1,47 @@
+# Gray-Scott temporal V-JEPA — "trained correctly" config.
+# Same model as aduplessi's run. NO VRMSE monitoring during training: selecting the epoch
+# on the VRMSE we then report = leakage / cheating. Selection is done on the SSL objective
+# only (latent val-loss on trajectory-disjoint valid trajectories — legitimate, it is the
+# model's own loss, not the downstream metric). VRMSE is computed ONCE at the end, on TEST.
+# Changes vs cfgs/train.yaml:
+#   * ckpt_dir -> OUR space (do not touch aduplessi's)
+#   * eval_every: 0  -> NO inline VRMSE (no peeking at the eval metric)
+#   * save_every: 1  -> keep every epoch so we can select by latent val-loss post-hoc
+#   * epochs: 30     -> early-stop / select on the latent val-loss curve
+meta:
+  seed: 0
+  ckpt_dir: /lustre/work/vivatech-jepadormi/abenmanso/checkpoints/gray_scott/vjepa
+data:
+  data_root: /lustre/work/pdl17890/udl806719/datasets/the_well/gray_scott_reaction_diffusion
+  split: train
+  channels: 2
+  img_size: 128
+  n_frames: 10          # frames per clip
+  time_stride: 4        # Gray-Scott evolves slowly -> space frames out
+  epoch_size: 8000
+  batch_size: 8
+  num_workers: 8
+model:
+  dobs: 2               # two chemical fields A, B (encoder in_d)
+  henc: 32              # encoder hidden width
+  dstc: 16              # latent dim D (encoder out_d)
+  hpre: 32              # predictor (ResUNet) hidden width
+  steps: 4              # JEPA prediction steps (context_length=2)
+  std_coeff: 10.0       # VCLoss variance term (anti-collapse)
+  cov_coeff: 100.0      # VCLoss covariance term
+loss:
+  std_coeff: 10.0
+  cov_coeff: 100.0
+optim:
+  epochs: 30
+  lr: 1.0e-3
+training:
+  use_amp: true
+  dtype: bfloat16
+logging:
+  log_every: 50
+  save_every: 1         # save epoch_N.pth.tar EVERY epoch -> select post-hoc by latent val-loss
+  eval_every: 0         # NO inline VRMSE — do not peek at the reported metric during training
+  log_wandb: true
+  wandb_project: eb_jepa
+  wandb_run_name: gray_scott_vjepa_abenmanso

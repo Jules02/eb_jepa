@@ -98,12 +98,19 @@ class _FrameDecoderV2(nn.Module):
         return out.view(B, T, 2, H, W).permute(0, 2, 1, 3, 4)
 
 
-def _train_decoder(decoder, jepa, encoder, device, epochs=5):
-    """Train decoder (frozen JEPA) to minimise MSE(decode(encode(x)), x)."""
-    dcfg = GrayScottConfig(split="train", epoch_size=2000, batch_size=8, num_workers=4)
+def _train_decoder(decoder, jepa, encoder, device, epochs=40):
+    """Train decoder (frozen JEPA) to minimise MSE(decode(encode(x)), x).
+
+    Trains until the MSE plateaus (early stop) rather than a fixed 5 passes — the
+    decoder's reconstruction error IS the VRMSE *floor*, so it must converge well
+    below the persistence baseline for the rollout metric to mean anything.
+    """
+    dcfg = GrayScottConfig(split="train", epoch_size=4000, batch_size=8, num_workers=4)
     loader = make_loader(dcfg)
     opt = torch.optim.Adam(decoder.parameters(), lr=1e-3)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     decoder.train()
+    prev, patience = float("inf"), 0
     for ep in range(epochs):
         total, n = 0.0, 0
         for batch in loader:
@@ -116,7 +123,18 @@ def _train_decoder(decoder, jepa, encoder, device, epochs=5):
             loss.backward()
             opt.step()
             total += loss.item(); n += 1
-        print(f"[decoder] ep{ep} mse={total/n:.4f}", flush=True)
+        sched.step()
+        mse = total / n
+        print(f"[decoder] ep{ep:02d} mse={mse:.5f} lr={sched.get_last_lr()[0]:.2e}", flush=True)
+        # early stop: < 1% relative improvement for 4 consecutive epochs
+        if (prev - mse) / (prev + 1e-8) < 0.01:
+            patience += 1
+            if patience >= 4:
+                print(f"[decoder] converged at ep{ep}, stopping early", flush=True)
+                break
+        else:
+            patience = 0
+        prev = mse
     decoder.eval()
 
 
@@ -216,6 +234,30 @@ def vrmse_per_horizon(jepa, encoder, decoder, loader, device, H, metric="vrmse")
     return result
 
 
+@torch.no_grad()
+def vrmse_fixed(jepa, encoder, decoder, clips, device, H, bs=8, metric="vrmse"):
+    """VRMSE over a FIXED clip set. metric='vrmse' = The Well paper (mean-of-ratios),
+    'pooled' = stable diagnostic. Same jepa/persistence/floor, reproducible."""
+    from examples.gray_scott.eval_common import make_vrmse, iter_batches
+    accs = {k: make_vrmse(metric, H) for k in _HEADLINE_KEYS}   # jepa, persistence, floor
+    for xb in iter_batches(clips, bs):
+        x = xb.to(device)                                  # [B,2,C+H,H,W]
+        last_ctx = x[:, :, C - 1]
+        pred_z = rollout_latents(jepa, x, H, device)
+        pred_fields = decoder(pred_z[:, :, C:])            # [B,2,H,Hs,Ws]
+        for h in range(H):
+            true = x[:, :, C + h]
+            accs["jepa"].add(h, pred_fields[:, :, h], true)
+            accs["persistence"].add(h, last_ctx, true)
+            floor_field = decoder(encoder(true.unsqueeze(2))).squeeze(2)
+            accs["floor"].add(h, floor_field, true)
+    result = {}
+    for k in _HEADLINE_KEYS:
+        s = accs[k].scores()
+        result[k] = s["all"]; result[f"{k}_u"] = s["u"]; result[f"{k}_v"] = s["v"]
+    return result
+
+
 def window_vrmse(scores, window_name):
     """Average VRMSE over a named window. Returns all keys (headline + _u/_v)."""
     start, end = WELL_WINDOWS[window_name]
@@ -227,18 +269,30 @@ def window_vrmse(scores, window_name):
 def main():
     ckpt_path = sys.argv[sys.argv.index("--ckpt") + 1]
     H = int(sys.argv[sys.argv.index("--H") + 1]) if "--H" in sys.argv else 30
+    # split: "valid" for model selection, "test" for the final report (no leakage).
+    split = sys.argv[sys.argv.index("--split") + 1] if "--split" in sys.argv else "valid"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     jepa, encoder = load_jepa(ckpt, device)
-    dstc = int(OmegaConf.create(ckpt["cfg"]).model.dstc)
+    cfg = OmegaConf.create(ckpt["cfg"])
+    dstc = int(cfg.model.dstc)
+    # stride MUST match the model's training stride for the autoregressive rollout to be
+    # physically meaningful (one predictor step = `stride` native steps). Default to the
+    # checkpoint's own training stride; override with --stride only if you know what you do.
+    stride = int(sys.argv[sys.argv.index("--stride") + 1]) if "--stride" in sys.argv \
+        else int(cfg.data.get("time_stride", 4))
     decoder = build_decoder(dstc, device, ckpt_path=ckpt_path)
-    print(f"[gs-eval] loaded (epoch {ckpt.get('epoch')}), H={H}", flush=True)
+    n_clips = int(sys.argv[sys.argv.index("--n_clips") + 1]) if "--n_clips" in sys.argv else 400
+    seed = int(sys.argv[sys.argv.index("--seed") + 1]) if "--seed" in sys.argv else 0
+    metric = sys.argv[sys.argv.index("--metric") + 1] if "--metric" in sys.argv else "vrmse"
+    print(f"[gs-eval] loaded (epoch {ckpt.get('epoch')}), split={split}, H={H}, "
+          f"stride={stride}, n_clips={n_clips}, seed={seed}, metric={metric}", flush=True)
 
-    dcfg = GrayScottConfig(split="valid", n_frames=C + H, time_stride=4,
-                           epoch_size=400, batch_size=8, num_workers=8)
-    loader = make_loader(dcfg, shuffle=False)
-    scores = vrmse_per_horizon(jepa, encoder, decoder, loader, device, H)
+    # FIXED, shared eval set + chosen metric (default = The Well VRMSE) -> comparable
+    from examples.gray_scott.eval_common import load_or_build_fixed_eval, default_cache_dir
+    clips = load_or_build_fixed_eval(split, C + H, stride, n_clips, seed, default_cache_dir())
+    scores = vrmse_fixed(jepa, encoder, decoder, clips, device, H, metric=metric)
 
     # Per-horizon headlines
     for name in _HEADLINE_KEYS:

@@ -1,8 +1,12 @@
-"""Continue training the decoder saved in a checkpoint for more epochs.
+"""Train (or fine-tune) the latent->field decoder stored in a checkpoint.
 
 Usage:
-    python -m examples.gray_scott.train_decoder --ckpt <path> [--epochs 30]
+    python -m examples.gray_scott.train_decoder --ckpt <path> [--epochs 30] [--init_from <other_ckpt>]
+
+--init_from warm-starts the decoder from another checkpoint's decoder weights (e.g. train
+epoch_25's decoder from epoch_10's — same run, similar latent -> far fewer epochs to converge).
 """
+import os
 import sys
 import torch
 import torch.nn as nn
@@ -15,6 +19,7 @@ from examples.gray_scott.eval import _FrameDecoder, load_jepa
 def main():
     ckpt_path = sys.argv[sys.argv.index("--ckpt") + 1]
     extra_epochs = int(sys.argv[sys.argv.index("--epochs") + 1]) if "--epochs" in sys.argv else 30
+    init_from = sys.argv[sys.argv.index("--init_from") + 1] if "--init_from" in sys.argv else None
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -24,7 +29,13 @@ def main():
     decoder = _FrameDecoder(D=dstc).to(device)
     if "decoder" in ckpt:
         decoder.load_state_dict(ckpt["decoder"])
-        print(f"[decoder] loaded existing weights from {ckpt_path}", flush=True)
+        print(f"[decoder] resumed from this checkpoint's own decoder", flush=True)
+    elif init_from is not None:
+        src = torch.load(init_from, map_location=device, weights_only=False)
+        if "decoder" not in src:
+            raise KeyError(f"--init_from {init_from} has no 'decoder' key")
+        decoder.load_state_dict(src["decoder"])
+        print(f"[decoder] WARM-START from {init_from}", flush=True)
     else:
         print("[decoder] no saved weights, starting from scratch", flush=True)
 
@@ -62,7 +73,9 @@ def main():
 
     decoder.eval()
     ckpt["decoder"] = decoder.state_dict()
-    torch.save(ckpt, ckpt_path)
+    tmp = f"{ckpt_path}.tmp.{os.getpid()}"
+    torch.save(ckpt, tmp)
+    os.replace(tmp, ckpt_path)                          # atomic
     print(f"[decoder] saved to {ckpt_path}", flush=True)
 
 

@@ -184,6 +184,9 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
         reg_type: str = "vicreg",
         sigreg_coeff: float = 0.0,
         sigreg_num_slices: int = 256,
+        tdist_coeff: float = 0.0,
+        dist_split_frac: float = 0.0,
+        cross_cov_coeff: float = 0.0,
     ):
         """
         Composite Regularizer combining multiple losses
@@ -219,6 +222,20 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
         self.reg_type = reg_type
         self.sigreg_coeff = sigreg_coeff
         self.sigreg_num_slices = sigreg_num_slices
+
+        # Temporal-distance term: make latent distance grow monotonically with the
+        # temporal gap |i-j| along the trajectory, so ||E(s_i)-E(s_j)|| reflects the
+        # number of steps in the dataset trajectories (a proxy for geodesic distance,
+        # wall-aware) rather than raw Euclidean position distance.
+        self.tdist_coeff = tdist_coeff
+
+        # h1/h2 disentangle split (channel dim). If dist_split_frac > 0, the latent is
+        # split into h1 = z[:, :k] (k = round(frac * C), the GEOMETRY block carrying the
+        # distance/tdist signal) and h2 = z[:, k:] (the CONTROL block carrying IDM). The
+        # IDM path stop-grads h1 so action identity only shapes h2; cross_cov_coeff then
+        # decorrelates the two blocks. Fraction (not absolute) so it is robust to C.
+        self.dist_split_frac = dist_split_frac
+        self.cross_cov_coeff = cross_cov_coeff
 
         self.first_t_only = first_t_only
         self.projector = nn.Identity() if projector is None else projector
@@ -258,13 +275,39 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
         else:
             sim_loss_t = self.sim_loss_fn(x_unprojected)
 
+        # ---- optional h1/h2 disentangle split (along channel dim C) ----
+        # h1 = x[:, :k] carries GEOMETRY (distance/tdist); h2 = x[:, k:] carries CONTROL
+        # (IDM). k from a fraction so it is robust to the latent channel count.
+        k = int(round(self.dist_split_frac * c))
+        use_split = self.dist_split_frac > 0.0 and 0 < k < c
+
+        # TEMPORAL-DISTANCE LOSS (rank latent distances by temporal gap |i-j|)
+        tdist_loss = torch.zeros((), device=x.device)
+        if self.tdist_coeff > 0:
+            if use_split:
+                x_h1 = x[:, :k].permute(2, 0, 1, 3, 4).reshape(t, b, -1)
+                tdist_loss = self._temporal_dist(x_h1)
+            else:
+                tdist_loss = self._temporal_dist(x_unprojected)
+
         # IDM LOSS
         idm_loss = torch.tensor(0.0, device=x.device)
         if self.idm_coeff > 0 and self.idm_loss_fn is not None and actions is not None:
             if self.idm_after_proj:
                 idm_loss = self.idm_loss_fn(x_projected_reshaped, actions)
+            elif use_split:
+                # IDM shapes h2 only: stop-grad on h1 keeps the geometry block free of
+                # action-identity info. Input dim stays full C so the IDM module is unchanged.
+                x_idm = torch.cat([x[:, :k].detach(), x[:, k:]], dim=1)
+                x_idm = x_idm.permute(2, 0, 1, 3, 4).reshape(t, b, -1)
+                idm_loss = self.idm_loss_fn(x_idm, actions)
             else:
                 idm_loss = self.idm_loss_fn(x_unprojected, actions)
+
+        # CROSS-DECORRELATION between h1 and h2 (squared cross-correlation -> 0)
+        cross_cov_loss = torch.zeros((), device=x.device)
+        if use_split and self.cross_cov_coeff > 0:
+            cross_cov_loss = self._cross_decorr(x, k)
 
         # STD and COV LOSS
         if self.spatial_as_samples:
@@ -308,9 +351,12 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
             vc_weighted
             + self.sim_coeff_t * sim_loss_t
             + self.idm_coeff * idm_loss
+            + self.tdist_coeff * tdist_loss
+            + self.cross_cov_coeff * cross_cov_loss
         )
         total_unweighted_loss = (
             cov_loss + std_loss + sigreg_loss + sim_loss_t + idm_loss
+            + tdist_loss + cross_cov_loss
         )
 
         loss_dict = {
@@ -319,9 +365,64 @@ class VC_IDM_Sim_Regularizer(torch.nn.Module):
             "sigreg_loss": sigreg_loss.item(),
             "sim_loss_t": sim_loss_t.item(),
             "idm_loss": idm_loss if isinstance(idm_loss, float) else idm_loss.item(),
+            "tdist_loss": tdist_loss.item(),
+            "cross_cov_loss": cross_cov_loss.item(),
         }
 
         return total_weighted_loss, total_unweighted_loss, loss_dict
+
+    def _cross_decorr(self, x, k):
+        """Decorrelate the geometry block h1 = x[:, :k] from the control block h2 = x[:, k:].
+
+        Penalises the mean squared cross-CORRELATION (scale-free) between every h1 feature
+        and every h2 feature -> the off-diagonal block of the full covariance matrix. This
+        is what stops action-identity info (which IDM injects into h2) from leaking back
+        into the distance-bearing block.
+
+        Args:
+            x: [B, C, T, H, W] latent activations.
+            k: number of channels in h1.
+        Returns:
+            Scalar cross-decorrelation loss.
+        """
+        b, c, t, h, w = x.shape
+        z = x.permute(0, 2, 3, 4, 1).reshape(-1, c)          # [N, C], N = B*T*H*W
+        z = z - z.mean(dim=0, keepdim=True)
+        n = z.shape[0]
+        a, bb = z[:, :k], z[:, k:]                            # [N, k], [N, C-k]
+        cross = (a.transpose(0, 1) @ bb) / (n - 1)           # [k, C-k] cross-covariance
+        sa = a.std(dim=0).clamp_min(1e-4)                     # [k]
+        sb = bb.std(dim=0).clamp_min(1e-4)                    # [C-k]
+        corr = cross / (sa[:, None] * sb[None, :])           # -> cross-correlation
+        return corr.pow(2).mean()
+
+    def _temporal_dist(self, x_seq):
+        """Make latent distance reflect temporal (trajectory) distance.
+
+        For every anchor a, we want pairs closer in time to be closer in latent space:
+        gap(a, p) < gap(a, n)  =>  ||z_a - z_p|| < ||z_a - z_n||. We enforce this with a
+        scale-free pairwise logistic (Bradley-Terry) ranking over all such triplets.
+
+        Args:
+            x_seq: [T, B, D] encoded trajectory (T time steps, B batch, D features).
+        Returns:
+            Scalar ranking loss (0 if T < 3).
+        """
+        T = x_seq.shape[0]
+        if T < 3:
+            return torch.zeros((), device=x_seq.device)
+        z = x_seq.permute(1, 0, 2)                       # [B, T, D]
+        d = torch.cdist(z, z, p=2)                        # [B, T, T] latent distances
+        idx = torch.arange(T, device=x_seq.device)
+        gap = (idx[:, None] - idx[None, :]).abs()         # [T, T] temporal gaps
+        valid = gap[:, :, None] < gap[:, None, :]         # [T(a), T(p), T(n)]
+        if not valid.any():
+            return torch.zeros((), device=x_seq.device)
+        d_ap = d[:, :, :, None]                            # [B, T, T(p), 1]
+        d_an = d[:, :, None, :]                            # [B, T, 1, T(n)]
+        # want d_an - d_ap > 0 ; logistic ranking, averaged over valid triplets & batch
+        rank = -F.logsigmoid(d_an - d_ap)                  # [B, T, T, T]
+        return rank[:, valid].mean()
 
     def _sigreg(self, x):
         """SIGReg anti-collapse term (LeJEPA): push the batch marginal toward an
